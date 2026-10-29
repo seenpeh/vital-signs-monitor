@@ -2,6 +2,7 @@
 
 Every interval, each patient's monitor produces a raw reading, its edge
 processor cleans it and updates the 5-minute stats, and both are saved.
+At start-up, 5 minutes of history are pre-filled (see warm_up).
 
 Run:  python -m monitor.run --patients 3 --seed 42
 """
@@ -10,27 +11,54 @@ import time
 
 from monitor import storage
 from monitor.config import REAL_DATA_CSV, SAMPLE_INTERVAL_S
-from monitor.processing import EdgeProcessor
+from monitor.processing import STATS_WINDOW, EdgeProcessor
 from monitor.simulator import make_patients
 
+WARMUP_SAMPLES = STATS_WINDOW  # 5 minutes of history at start-up
 
-def run(patients, interval_s, conn):
+
+def tick(patients, processors, ts, interval_s):
+    """One reading per patient at time `ts`; returns the rows to save."""
+    readings, processed, events = [], [], []
+    for p in patients:
+        reading, event = p.step()
+        readings.append({"patient_id": p.id, "ts": ts, **reading})
+        processed.append({"patient_id": p.id, "ts": ts,
+                          **processors[p.id].process(reading)})
+        if event:
+            events.append({"patient_id": p.id, "kind": event.kind,
+                           "vital": event.vital, "start_ts": ts,
+                           "end_ts": ts + event.length * interval_s})
+    return readings, processed, events
+
+
+def warm_up(patients, processors, interval_s, conn):
+    """Pre-fill 5 minutes of history, as if monitoring had started earlier.
+
+    Without it the dashboard, filter and 5-minute stats need 5 minutes to
+    fill. Injected events are paused so every patient starts stable; the
+    natural noise and real-data spikes still apply.
+    """
+    event_rates = [(p.p_clinical, p.p_artifact) for p in patients]
+    for p in patients:
+        p.p_clinical = p.p_artifact = 0
+    start = time.time() - WARMUP_SAMPLES * interval_s
+    rows = ([], [], [])
+    for i in range(WARMUP_SAMPLES):
+        new = tick(patients, processors, start + i * interval_s, interval_s)
+        for all_rows, new_rows in zip(rows, new):
+            all_rows.extend(new_rows)
+    storage.save(conn, *rows)
+    for p, (clinical, artifact) in zip(patients, event_rates):
+        p.p_clinical, p.p_artifact = clinical, artifact
+
+
+def run(patients, processors, interval_s, conn):
     """Process one reading per patient every `interval_s` s until Ctrl+C."""
-    processors = {p.id: EdgeProcessor() for p in patients}
     next_tick = time.monotonic()
     while True:
-        now = time.time()
-        readings, processed, events = [], [], []
-        for p in patients:
-            reading, event = p.step()
-            readings.append({"patient_id": p.id, "ts": now, **reading})
-            processed.append({"patient_id": p.id, "ts": now,
-                              **processors[p.id].process(reading)})
-            if event:
-                events.append({"patient_id": p.id, "kind": event.kind,
-                               "vital": event.vital, "start_ts": now,
-                               "end_ts": now + event.length * interval_s})
-        storage.save(conn, readings, processed, events)
+        storage.save(conn, *tick(patients, processors, time.time(),
+                                 interval_s))
         next_tick += interval_s
         time.sleep(max(0.0, next_tick - time.monotonic()))
 
@@ -58,10 +86,12 @@ def main():
 
     conn = storage.connect()
     storage.reset(conn)  # each run starts a fresh simulated session
-    print(f"Monitoring {len(patients)} patients, Ctrl+C to stop.",
-          flush=True)
+    processors = {p.id: EdgeProcessor() for p in patients}
+    warm_up(patients, processors, args.interval, conn)
+    print(f"Monitoring {len(patients)} patients (5 min of history "
+          "pre-filled), Ctrl+C to stop.", flush=True)
     try:
-        run(patients, args.interval, conn)
+        run(patients, processors, args.interval, conn)
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:

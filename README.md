@@ -21,6 +21,8 @@ python -m monitor.run                  # 3 patients, one reading every 2 s
 streamlit run dashboard.py             # opens http://localhost:8501
 ```
 
+At start-up, the pipeline pre-fills 5 minutes of history (see below), so the dashboard is complete immediately.
+
 Options for `monitor.run`: `--patients N`, `--interval SECONDS`, `--seed N` (the same seed gives the same readings and the same events).
 
 Run the tests:
@@ -149,6 +151,7 @@ The trend needs at least 1 minute of data, because a slope fitted over a few sec
 | SpO2 drop also raises HR | Yes | Low oxygen makes the heart speed up. That also makes the task's "SpO2 < 90 and HR up = Critical" rule testable. |
 | Processing runs in the same program as the simulator | Yes | Filtering happens the moment a reading is made, like a bedside gateway. There's no polling or "last processed row" bookkeeping, and only 2 programs to start in the demo. Each layer is still its own module. |
 | Filter | Rolling median, 7 samples | It ignores glitches up to 3 samples long. It's simple to explain, and its 8 s delay is in line with real monitors' alarm delays. |
+| Warm-up | Pre-fill 5 minutes of history at start-up, with injected events paused | Without it the charts, the filter and the 5-minute statistics need 5 minutes to fill, which is too slow for a demo. It works as if the patient had been connected 5 minutes earlier. Events are paused so every patient starts stable and no alerts from before start-up appear. Natural noise and real-data spikes still apply. |
 | One event at a time per patient | Yes | Keeps the ground truth unambiguous. Can be relaxed later to test artefacts that land during a crisis. |
 | Sampling interval | 2 s | Taken from the task statement. It is also the real monitor's (GE Solar 8000M) numeric output rate. |
 
