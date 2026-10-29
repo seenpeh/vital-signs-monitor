@@ -1,0 +1,7 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+*.db
+# task statement stays private
+InitialTask_Pournasiri.pdf
