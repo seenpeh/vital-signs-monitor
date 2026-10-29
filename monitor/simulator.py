@@ -13,14 +13,11 @@ On top of that we inject events:
 * artefacts: short SpO2 dips (sensor motion) and dropouts (probe off) -
   these should be filtered out, not alarmed on.
 
-Run:  python -m monitor.simulator --patients 3 --seed 42
+Run it through the pipeline:  python -m monitor.run
 """
-import argparse
 import random
-import time
 from dataclasses import dataclass
 
-from monitor import storage
 from monitor.config import REAL_DATA_COLUMNS, REAL_DATA_CSV, SAMPLE_INTERVAL_S
 from monitor.model import fit_from_csv
 
@@ -142,60 +139,3 @@ def make_patients(count, seed):
     models = fit_from_csv(REAL_DATA_CSV, REAL_DATA_COLUMNS)
     rng = random.Random(seed)
     return [Patient(f"P{i}", models, rng) for i in range(1, count + 1)]
-
-
-def run(patients, interval_s, conn):
-    """Emit one reading per patient every `interval_s` seconds until Ctrl+C."""
-    next_tick = time.monotonic()
-    while True:
-        now = time.time()
-        readings, events = [], []
-        for p in patients:
-            reading, event = p.step()
-            readings.append({"patient_id": p.id, "ts": now, **reading})
-            if event:
-                events.append({"patient_id": p.id, "kind": event.kind,
-                               "vital": event.vital, "start_ts": now,
-                               "end_ts": now + event.length * interval_s})
-        storage.save(conn, readings, events)
-        next_tick += interval_s
-        time.sleep(max(0.0, next_tick - time.monotonic()))
-
-
-def positive_int(text):
-    value = int(text)
-    if value < 1:
-        raise argparse.ArgumentTypeError("must be at least 1")
-    return value
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--patients", type=positive_int, default=3)
-    parser.add_argument("--interval", type=float, default=SAMPLE_INTERVAL_S,
-                        help="seconds between readings (playback speed)")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="same seed -> same readings and events")
-    args = parser.parse_args()
-
-    try:
-        patients = make_patients(args.patients, args.seed)
-    except FileNotFoundError:
-        parser.exit(1, f"Real data not found: {REAL_DATA_CSV}\n")
-
-    conn = storage.connect()
-    storage.reset(conn)  # each run starts a fresh simulated session
-    for vital, m in patients[0].models.items():
-        print(f"fitted {vital}: jitter_sd={m.jitter_sd:.2f} "
-              f"spikes/hour={m.spike_rate * 3600 / SAMPLE_INTERVAL_S:.1f}")
-    print(f"Simulating {len(patients)} patients, Ctrl+C to stop.")
-    try:
-        run(patients, args.interval, conn)
-    except KeyboardInterrupt:
-        print("\nStopped.")
-    finally:
-        conn.close()
-
-
-if __name__ == "__main__":
-    main()
