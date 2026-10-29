@@ -2,7 +2,7 @@
 
 A small IoMT prototype. It simulates vital signs for several patients, filters out noise and outliers at the edge, sorts each patient into a risk level (Normal / Warning / Critical), stores alerts in a database, and shows everything on a live dashboard.
 
-> Status: step 1 is done (patient simulator plus live dashboard). The filtering and alert engine come next.
+> Status: steps 1–2 are done (simulator, edge filtering and window statistics, live dashboard). The alert engine comes next.
 
 ## Quick start
 
@@ -17,11 +17,11 @@ pip install -r requirements.txt
 Run the two parts in two terminals:
 
 ```bash
-python -m monitor.simulator            # 3 patients, one reading every 2 s
+python -m monitor.run                  # 3 patients, one reading every 2 s
 streamlit run dashboard.py             # opens http://localhost:8501
 ```
 
-Simulator options: `--patients N`, `--interval SECONDS`, `--seed N` (the same seed gives the same readings and the same events).
+Options for `monitor.run`: `--patients N`, `--interval SECONDS`, `--seed N` (the same seed gives the same readings and the same events).
 
 Run the tests:
 
@@ -32,19 +32,24 @@ python -m unittest
 ## Architecture
 
 ```
-monitor/simulator.py  ──writes──▶  data/monitor.db (SQLite)  ◀──reads──  dashboard.py
-        │                              readings, events
-        └─ monitor/model.py  (fits the noise model from real data)
+monitor/run.py  (one program, one loop every 2 s)
+  ├─ simulator.py   sensor:  makes a raw reading per patient
+  ├─ processing.py  edge:    cleans it, updates 5-minute stats
+  └─ storage.py     saves raw + processed + events  ──▶  data/monitor.db (SQLite)
+                                                              │ reads
+                                                         dashboard.py
 ```
 
 | Layer | File | Role |
 |---|---|---|
-| Simulation | `monitor/simulator.py`, `monitor/model.py` | One `Patient` per bedside node. Produces HR, SpO2 and SBP every 2 s. |
-| Storage | `monitor/storage.py` | SQLite in WAL mode, so the dashboard can read while the simulator writes. |
-| UI | `dashboard.py` | Streamlit. Refreshes every 2 s and shows the last 5 minutes. |
+| Simulation | `monitor/simulator.py`, `monitor/model.py` | One `Patient` per bedside node. Produces raw HR, SpO2 and SBP every 2 s. |
+| Edge processing | `monitor/processing.py` | One `EdgeProcessor` per patient: filters each reading and keeps 5-minute statistics. |
+| Storage | `monitor/storage.py` | SQLite in WAL mode, so the dashboard can read while the pipeline writes. Tables: `readings` (raw), `processed`, `events`. |
+| Pipeline | `monitor/run.py` | Connects the layers. Each layer is its own module and knows nothing about the others. |
+| UI | `dashboard.py` | Streamlit. Refreshes every 2 s and shows the last 5 minutes, raw and cleaned. |
 | Config | `monitor/config.py` | Normal ranges, paths and the sampling interval. |
 
-The simulator and the dashboard are separate processes that share only the database. Either one can be restarted without touching the other.
+The pipeline and the dashboard are separate processes that share only the database.
 
 ## Simulation model
 
@@ -103,6 +108,37 @@ reading  = round(reading)                              # monitors report whole n
 
 Each patient averages one clinical event every 3 minutes and one artefact every 30 seconds. The real case has no SpO2 spikes, but motion-induced SpO2 drops are the classic false alarm, so we inject them to test the filter. The natural HR and SBP spikes from the real data are background texture and are not logged. Every event is saved to the `events` table as ground truth. That table lets us measure false alarms and missed alarms later. The detector itself must never read it.
 
+## Edge processing
+
+### Filter: rolling median
+
+Each clean value is the **median of the last 7 raw readings** (14 s). The filter only looks at the past, so it runs live.
+
+```
+glitch:     97 97 97 [80] 97 97 97   → sorted 80 97 97 [97] 97 97 97 → 97  ✅ ignored
+real drop:  97 97 97 [85 85 85 85]   → sorted 85 85 85 [85] 97 97 97 → 85  ✅ accepted
+```
+
+- A glitch of up to **3 samples** can never be the middle value, so it disappears.
+- A real change is accepted once it lasts **4 samples (8 s)**, close to the 10–15 s alarm delay real bedside monitors use.
+- No clean value is reported until the window is full (14 s at start-up), or while most of the window is missing (probe off). Otherwise a short glitch could be the majority.
+
+Why not a moving average or EMA? An average lets a −40 spike pull the result down for several samples, so glitches leak through and could trigger alarms.
+
+**Known limit:** a *burst* of motion glitches (4 or more within 14 s) looks exactly like the start of a real drop, so it passes the filter. In 9 simulated patient-hours this happened 58 times, each lasting at most 18 s. The alert engine (step 3) handles these: a motion glitch does not raise the heart rate and lasts only seconds, while a real desaturation raises HR and lasts minutes. `tests/test_processing.py` checks this guarantee: false lows are always shorter than 20 s, and every real drop is still caught.
+
+### Window statistics (5 minutes)
+
+For each vital, over the last 5 minutes of **cleaned** values:
+
+| Statistic | How | Shown on the dashboard as |
+|---|---|---|
+| Mean | average | `5 min: 97.2 ± 0.4` |
+| SD | sample standard deviation | the `± 0.4` |
+| Trend | slope of a straight line fitted through the window, in units per minute | `+1.5/min` |
+
+The trend needs at least 1 minute of data, because a slope fitted over a few seconds swings wildly. All values are stored with each processed reading, so the alert engine can use them without recomputing.
+
 ## Assumptions and design decisions
 
 | Decision | Choice | Why |
@@ -111,6 +147,8 @@ Each patient averages one clinical event every 3 minutes and one artefact every 
 | Transport between nodes and the server | Shared SQLite database | No broker to install, and real layer separation. The alerts in step 3 need a database anyway. MQTT would be the production choice. |
 | Anomaly timing | Random with a fixed seed | Realistic, yet every run is identical, which is what the report and the demo need. |
 | SpO2 drop also raises HR | Yes | Low oxygen makes the heart speed up. That also makes the task's "SpO2 < 90 and HR up = Critical" rule testable. |
+| Processing runs in the same program as the simulator | Yes | Filtering happens the moment a reading is made, like a bedside gateway. There's no polling or "last processed row" bookkeeping, and only 2 programs to start in the demo. Each layer is still its own module. |
+| Filter | Rolling median, 7 samples | It ignores glitches up to 3 samples long. It's simple to explain, and its 8 s delay is in line with real monitors' alarm delays. |
 | One event at a time per patient | Yes | Keeps the ground truth unambiguous. Can be relaxed later to test artefacts that land during a crisis. |
 | Sampling interval | 2 s | Taken from the task statement. It is also the real monitor's (GE Solar 8000M) numeric output rate. |
 
