@@ -1,24 +1,38 @@
-"""Fit the per-vital fluctuation model from a real VitalDB recording.
+"""Fit per-vital noise from a real VitalDB recording.
 
-A bedside monitor reports integer values that often repeat, then move by a
-small step. We measure both behaviours on the real 2-second data:
+Looking at the real signals, each one is
 
-* hold_prob: share of samples where the reading did not change.
-* step_sd:   spread of the non-zero changes. Estimated with the median
-             absolute value (x 1.4826) so that artefact jumps in the real
-             data (e.g. arterial line flushes) do not inflate it.
+    reading = slow level + small jitter + occasional spikes
+
+We fit the two parts that a single recording measures reliably:
+
+* spikes: samples far from their neighbours' median. We count how often
+  they happen and keep their real sizes, to replay them in the simulator.
+* jitter: fresh noise on every sample. With spikes removed, it shows up as
+  neighbouring changes cancelling out (+2 then -2):
+
+      cov(d[t], d[t+1]) = -jitter_sd^2    where d = change per sample
+
+The slow level is not fitted: in this surgical case it is driven by the
+operation (SBP 180 -> 98), not by how a stable patient drifts. The
+simulator sets it as an explicit assumption instead.
 """
 import csv
 import statistics
 from dataclasses import dataclass
 
-MAD_TO_SD = 1.4826  # converts a median absolute deviation to a normal SD
+SPIKE_WINDOW = 3     # neighbours on each side for the local median (14 s)
+SPIKE_MIN_SIZE = 5   # deviation from that median that counts as a spike
+# Changes larger than this are level jumps (e.g. arterial line connected),
+# not jitter.
+MAX_JITTER_STEP = 10
 
 
 @dataclass(frozen=True)
 class VitalModel:
-    hold_prob: float
-    step_sd: float
+    jitter_sd: float
+    spike_rate: float    # chance that a sample is a spike
+    spike_sizes: tuple   # real spike sizes, sampled at random
 
 
 def read_column(csv_path, column):
@@ -28,16 +42,42 @@ def read_column(csv_path, column):
                 for row in csv.DictReader(f)]
 
 
+def split_spikes(values):
+    """Return (values with spikes replaced by None, list of spike sizes)."""
+    clean, sizes = list(values), []
+    for i in range(SPIKE_WINDOW, len(values) - SPIKE_WINDOW):
+        window = [v for v in values[i - SPIKE_WINDOW:i + SPIKE_WINDOW + 1]
+                  if v is not None]
+        if values[i] is None or len(window) < SPIKE_WINDOW + 2:
+            continue
+        deviation = values[i] - statistics.median(window)
+        if abs(deviation) > SPIKE_MIN_SIZE:
+            clean[i] = None
+            sizes.append(deviation)
+    return clean, sizes
+
+
+def jitter_sd(values):
+    """SD of per-sample noise, from how much neighbouring changes cancel."""
+    changes = [b - a if a is not None and b is not None
+               and abs(b - a) <= MAX_JITTER_STEP else None
+               for a, b in zip(values, values[1:])]
+    pairs = [(a, b) for a, b in zip(changes, changes[1:])
+             if a is not None and b is not None]
+    if len(pairs) < 2:
+        raise ValueError("need more consecutive readings to fit")
+    mean = statistics.fmean(d for d in changes if d is not None)
+    cov = statistics.fmean([(a - mean) * (b - mean) for a, b in pairs])
+    return max(-cov, 0.0) ** 0.5  # positive cov: the monitor smooths
+
+
 def fit(values):
     """Fit a VitalModel from consecutive 2-second readings."""
-    steps = [b - a for a, b in zip(values, values[1:])
-             if a is not None and b is not None]
-    if not steps:
-        raise ValueError("need at least two consecutive readings to fit")
-    moves = [abs(s) for s in steps if s != 0]
-    hold_prob = 1 - len(moves) / len(steps)
-    step_sd = MAD_TO_SD * statistics.median(moves) if moves else 0.0
-    return VitalModel(hold_prob=hold_prob, step_sd=step_sd)
+    clean, sizes = split_spikes(values)
+    n_readings = sum(v is not None for v in values)
+    return VitalModel(jitter_sd=jitter_sd(clean),
+                      spike_rate=len(sizes) / n_readings,
+                      spike_sizes=tuple(sizes))
 
 
 def fit_from_csv(csv_path, columns):

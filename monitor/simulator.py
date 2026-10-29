@@ -1,13 +1,17 @@
 """Simulated bedside monitors: one Patient per node, a reading every 2 s.
 
-Each vital is a mean-reverting random walk around the patient's baseline.
-Its step behaviour (how often it holds, how big a move is) is fitted from
-real VitalDB data, see monitor/model.py. On top of that we inject:
+Each vital = slow level + jitter + occasional spikes:
 
-* clinical events: SpO2 drop (with compensatory heart-rate rise) and
-  arrhythmia (fast, irregular heart rate) - these should raise alerts;
-* sensor artefacts: one-sample spikes (motion) and short dropouts
-  (probe off) - these should be filtered out, not alarmed on.
+* slow level: random walk gently pulled back to the patient's baseline.
+  How far and how fast it wanders is an assumption (see TYPICAL_SPREAD).
+* jitter and spikes: fitted from real VitalDB data, see monitor/model.py.
+
+On top of that we inject events:
+
+* clinical: SpO2 drop (with compensatory heart-rate rise) and arrhythmia
+  (fast, irregular heart rate) - these should raise alerts;
+* artefacts: short SpO2 dips (sensor motion) and dropouts (probe off) -
+  these should be filtered out, not alarmed on.
 
 Run:  python -m monitor.simulator --patients 3 --seed 42
 """
@@ -22,11 +26,17 @@ from monitor.model import fit_from_csv
 
 # Each patient's resting baseline is drawn from inside the normal range.
 BASELINE_RANGES = {"hr": (65, 85), "spo2": (97, 99), "sbp": (100, 112)}
-# How far a stable patient typically wanders from baseline (1 SD).
-TYPICAL_SPREAD = {"hr": 4.0, "spo2": 1.0, "sbp": 4.0}
 
-CLINICAL_EVENT_EVERY_S = 180  # mean time between clinical events, per patient
-ARTIFACT_EVERY_S = 30         # mean time between sensor artefacts, per patient
+# Assumption: a stable patient's slow level wanders about this far from
+# baseline (1 SD) and takes about DRIFT_TIME_S to wander back. The real
+# recording can't tell us this: its trends come from the surgery.
+TYPICAL_SPREAD = {"hr": 4.0, "spo2": 1.0, "sbp": 4.0}
+DRIFT_TIME_S = 300
+
+# Per patient, mean time between events. Counted in samples, so --interval
+# only changes playback speed, not the simulated patient.
+CLINICAL_EVENT_EVERY_S = 180
+ARTIFACT_EVERY_S = 30
 
 
 @dataclass
@@ -34,19 +44,8 @@ class Event:
     kind: str
     start_tick: int
     length: int          # in samples
-    size: float = 0.0    # depth of drop / height of spike
+    size: float = 0.0    # depth of a drop or dip
     vital: str = None    # affected vital, for artefacts
-
-
-def reversion_for(model, spread):
-    """Pull towards baseline per move so the walk's SD settles at `spread`.
-
-    For x += -r*x + noise, the stationary variance is sd^2 / (1 - (1-r)^2).
-    """
-    ratio = (model.step_sd / spread) ** 2
-    if ratio >= 1:
-        return 1.0  # one step already exceeds the spread: always pull fully
-    return max(1 - (1 - ratio) ** 0.5, 0.01)
 
 
 def envelope(t, length, ramp):
@@ -55,32 +54,39 @@ def envelope(t, length, ramp):
 
 
 class Patient:
-    def __init__(self, patient_id, models, rng, interval_s=SAMPLE_INTERVAL_S):
+    def __init__(self, patient_id, models, rng):
         self.id = patient_id
         self.models = models
         self.rng = rng
         self.baseline = {v: rng.uniform(*BASELINE_RANGES[v]) for v in models}
         self.level = dict(self.baseline)
-        self.reversion = {v: reversion_for(m, TYPICAL_SPREAD[v])
-                          for v, m in models.items()}
-        self.p_clinical = interval_s / CLINICAL_EVENT_EVERY_S
-        self.p_artifact = interval_s / ARTIFACT_EVERY_S
+        # For x += -pull*x + N(0, sd), the level's variance settles at
+        # sd^2 / (1 - (1 - pull)^2); pick sd so that equals spread^2.
+        self.pull = SAMPLE_INTERVAL_S / DRIFT_TIME_S
+        self.drift_sd = {v: TYPICAL_SPREAD[v] * (1 - (1 - self.pull) ** 2)
+                         ** 0.5 for v in models}
+        self.p_clinical = SAMPLE_INTERVAL_S / CLINICAL_EVENT_EVERY_S
+        self.p_artifact = SAMPLE_INTERVAL_S / ARTIFACT_EVERY_S
         self.tick = 0
         self.event = None
 
     def step(self):
         """Advance one sample. Returns (reading, event started now or None)."""
+        rng = self.rng
+        reading = {}
         for vital, model in self.models.items():
-            if self.rng.random() >= model.hold_prob:
-                gap = self.baseline[vital] - self.level[vital]
-                self.level[vital] += (self.reversion[vital] * gap
-                                      + self.rng.gauss(0, model.step_sd))
+            gap = self.baseline[vital] - self.level[vital]
+            self.level[vital] += (self.pull * gap
+                                  + rng.gauss(0, self.drift_sd[vital]))
+            # jitter is drawn fresh each sample, so it never accumulates
+            reading[vital] = self.level[vital] + rng.gauss(0, model.jitter_sd)
+            if model.spike_sizes and rng.random() < model.spike_rate:
+                reading[vital] += rng.choice(model.spike_sizes)  # a real one
 
         started = None
         if self.event is None:
             self.event = started = self._maybe_start_event()
 
-        reading = dict(self.level)
         if self.event:
             self._apply(self.event, reading)
             if self.tick - self.event.start_tick + 1 >= self.event.length:
@@ -101,13 +107,12 @@ class Patient:
                              size=rng.uniform(10, 15))
             return Event("arrhythmia", tick, rng.randint(15, 45))  # 30-90 s
         if roll < self.p_clinical + self.p_artifact:
-            vital = rng.choice(list(self.models))
             if rng.random() < 0.7:
-                sign = rng.choice([-1, 1])
-                size = {"hr": sign * rng.uniform(30, 50),
-                        "spo2": -rng.uniform(10, 20),
-                        "sbp": sign * rng.uniform(30, 60)}[vital]
-                return Event("spike", tick, 1, size=size, vital=vital)
+                # The real case has no SpO2 spikes, but motion-induced SpO2
+                # dips are the classic false alarm; the filter must see them.
+                return Event("spo2_dip", tick, rng.randint(1, 3),
+                             size=rng.uniform(10, 20), vital="spo2")
+            vital = rng.choice(list(self.models))
             return Event("dropout", tick, rng.randint(2, 5), vital=vital)
         return None
 
@@ -119,8 +124,8 @@ class Patient:
             reading["hr"] += depth * 25  # the heart compensates for hypoxia
         elif event.kind == "arrhythmia":
             reading["hr"] += 35 + self.rng.gauss(0, 12)
-        elif event.kind == "spike":
-            reading[event.vital] += event.size
+        elif event.kind == "spo2_dip":
+            reading["spo2"] -= event.size
         elif event.kind == "dropout":
             reading[event.vital] = None
 
@@ -133,11 +138,10 @@ class Patient:
         return out
 
 
-def make_patients(count, seed, interval_s=SAMPLE_INTERVAL_S):
+def make_patients(count, seed):
     models = fit_from_csv(REAL_DATA_CSV, REAL_DATA_COLUMNS)
     rng = random.Random(seed)
-    return [Patient(f"P{i}", models, rng, interval_s)
-            for i in range(1, count + 1)]
+    return [Patient(f"P{i}", models, rng) for i in range(1, count + 1)]
 
 
 def run(patients, interval_s, conn):
@@ -169,21 +173,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--patients", type=positive_int, default=3)
     parser.add_argument("--interval", type=float, default=SAMPLE_INTERVAL_S,
-                        help="seconds between readings")
+                        help="seconds between readings (playback speed)")
     parser.add_argument("--seed", type=int, default=42,
                         help="same seed -> same readings and events")
     args = parser.parse_args()
 
     try:
-        patients = make_patients(args.patients, args.seed, args.interval)
+        patients = make_patients(args.patients, args.seed)
     except FileNotFoundError:
         parser.exit(1, f"Real data not found: {REAL_DATA_CSV}\n")
 
     conn = storage.connect()
     storage.reset(conn)  # each run starts a fresh simulated session
     for vital, m in patients[0].models.items():
-        print(f"fitted {vital}: hold_prob={m.hold_prob:.2f} "
-              f"step_sd={m.step_sd:.2f}")
+        print(f"fitted {vital}: jitter_sd={m.jitter_sd:.2f} "
+              f"spikes/hour={m.spike_rate * 3600 / SAMPLE_INTERVAL_S:.1f}")
     print(f"Simulating {len(patients)} patients, Ctrl+C to stop.")
     try:
         run(patients, args.interval, conn)

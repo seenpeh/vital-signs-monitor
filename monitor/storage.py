@@ -16,7 +16,7 @@ CREATE INDEX IF NOT EXISTS readings_by_time ON readings (ts);
 -- Ground truth of what the simulator injected, for checking the detector.
 CREATE TABLE IF NOT EXISTS events (
     patient_id TEXT NOT NULL,
-    kind       TEXT NOT NULL,  -- spo2_drop, arrhythmia, spike, dropout
+    kind       TEXT NOT NULL,  -- spo2_drop, arrhythmia, spo2_dip, dropout
     vital      TEXT,           -- affected vital, for sensor artefacts
     start_ts   REAL NOT NULL,
     end_ts     REAL NOT NULL
