@@ -25,7 +25,8 @@ def vital_chart(df, vital):
             .mark_rect(color="green", opacity=0.08)
             .encode(y=alt.Y("low:Q", scale=scale), y2="high:Q"))
     lines = (alt.Chart(df).mark_line()
-             .encode(x=alt.X("time:T", title=None),
+             .encode(x=alt.X("time:T", title=None,
+                             axis=alt.Axis(format="%H:%M:%S")),
                      y=alt.Y(f"{vital}:Q", title=VITALS[vital], scale=scale),
                      color=alt.Color("patient_id:N", title="Patient")))
     return (band + lines).properties(height=220)
