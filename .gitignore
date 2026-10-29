@@ -5,3 +5,5 @@ __pycache__/
 *.db
 # task statement stays private
 InitialTask_Pournasiri.pdf
+data/
+.claude/
