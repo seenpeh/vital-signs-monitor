@@ -15,6 +15,7 @@ from monitor.config import NORMAL_RANGES, SAMPLE_INTERVAL_S
 WINDOW_S = 5 * 60  # how much history the charts show
 VITALS = {"hr": "Heart rate (BPM)", "spo2": "SpO2 (%)",
           "sbp": "Systolic BP (mmHg)"}
+LEVEL_COLORS = {"normal": "green", "warning": "orange", "critical": "red"}
 
 
 def vital_chart(df, vital, title, domain):
@@ -48,12 +49,14 @@ def fmt(value, digits=1):
     return "—" if pd.isna(value) else f"{value:.{digits}f}"
 
 
-def show_latest(clean):
+def show_latest(clean, levels):
     latest = (clean.sort_values("ts").groupby("patient_id").tail(1)
               .sort_values("patient_id"))
     for col, (_, row) in zip(st.columns(len(latest)), latest.iterrows()):
+        level = levels.get(row.patient_id, "normal")  # no alert yet: normal
         with col.container(border=True):
-            st.subheader(row.patient_id)
+            st.subheader(f"{row.patient_id} "
+                         f":{LEVEL_COLORS[level]}[● {level.title()}]")
             for vital, label in VITALS.items():
                 trend = row[f"{vital}_trend"]
                 st.metric(label, fmt(row[vital], 0),
@@ -62,6 +65,18 @@ def show_latest(clean):
                           delta_color="off")
                 st.caption(f"5 min: {fmt(row[f'{vital}_mean'])} "
                            f"± {fmt(row[f'{vital}_sd'])}")
+
+
+def show_alerts(alerts):
+    st.subheader("Latest alerts")
+    if not alerts:
+        st.caption("None yet.")
+        return
+    table = pd.DataFrame(alerts)
+    table["time"] = [datetime.fromtimestamp(t).strftime("%H:%M:%S")
+                     for t in table.ts]
+    st.dataframe(table[["time", "patient_id", "level", "reason"]],
+                 hide_index=True, use_container_width=True)
 
 
 def show_events(events):
@@ -91,6 +106,8 @@ def live_view():
         raw_rows = storage.readings_since(conn, since)
         clean_rows = storage.processed_since(conn, since)
         events = storage.latest_events(conn)
+        alerts = storage.latest_alerts(conn)
+        levels = storage.current_levels(conn)
     finally:
         conn.close()
 
@@ -99,7 +116,8 @@ def live_view():
         return
 
     raw, clean = with_time(raw_rows), with_time(clean_rows)
-    show_latest(clean)
+    show_latest(clean, levels)
+    show_alerts(alerts)
     for vital in VITALS:
         show_charts(raw, clean, vital)
     show_events(events)
