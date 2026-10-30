@@ -24,6 +24,14 @@ CREATE TABLE IF NOT EXISTS processed (
 );
 CREATE INDEX IF NOT EXISTS processed_by_time ON processed (ts);
 
+-- Triage: one row each time a patient's level changes.
+CREATE TABLE IF NOT EXISTS alerts (
+    patient_id TEXT NOT NULL,
+    ts         REAL NOT NULL,
+    level      TEXT NOT NULL,  -- normal, warning, critical
+    reason     TEXT NOT NULL
+);
+
 -- Ground truth of what the simulator injected, for checking the detector.
 CREATE TABLE IF NOT EXISTS events (
     patient_id TEXT NOT NULL,
@@ -49,11 +57,12 @@ def reset(conn):
     with conn:
         conn.execute("DELETE FROM readings")
         conn.execute("DELETE FROM processed")
+        conn.execute("DELETE FROM alerts")
         conn.execute("DELETE FROM events")
 
 
-def save(conn, readings, processed, events):
-    """Insert one tick of raw and processed rows and new events atomically."""
+def save(conn, readings, processed, events, alerts):
+    """Insert one tick of rows, new events and alerts atomically."""
     with conn:
         conn.executemany(
             "INSERT INTO readings VALUES (:patient_id, :ts, :hr, :spo2, :sbp)",
@@ -68,6 +77,9 @@ def save(conn, readings, processed, events):
             "INSERT INTO events VALUES "
             "(:patient_id, :kind, :vital, :start_ts, :end_ts)",
             events)
+        conn.executemany(
+            "INSERT INTO alerts VALUES (:patient_id, :ts, :level, :reason)",
+            alerts)
 
 
 def readings_since(conn, ts):
@@ -80,6 +92,20 @@ def processed_since(conn, ts):
     rows = conn.execute(
         "SELECT * FROM processed WHERE ts >= ? ORDER BY ts", (ts,))
     return [dict(r) for r in rows]
+
+
+def latest_alerts(conn, limit=20):
+    rows = conn.execute(
+        "SELECT * FROM alerts ORDER BY ts DESC LIMIT ?", (limit,))
+    return [dict(r) for r in rows]
+
+
+def current_levels(conn):
+    """Latest level per patient that has had an alert."""
+    rows = conn.execute(
+        "SELECT patient_id, level FROM alerts a WHERE ts = "
+        "(SELECT MAX(ts) FROM alerts WHERE patient_id = a.patient_id)")
+    return {r["patient_id"]: r["level"] for r in rows}
 
 
 def latest_events(conn, limit=20):

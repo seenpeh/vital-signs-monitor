@@ -7,6 +7,7 @@ from monitor import storage
 from monitor.processing import EdgeProcessor
 from monitor.run import WARMUP_SAMPLES, warm_up
 from monitor.simulator import make_patients
+from monitor.triage import Triage
 
 
 class WarmUpTest(unittest.TestCase):
@@ -17,7 +18,8 @@ class WarmUpTest(unittest.TestCase):
             rates = [(p.p_clinical, p.p_artifact) for p in patients]
             processors = {p.id: EdgeProcessor() for p in patients}
 
-            warm_up(patients, processors, 2.0, conn)
+            triages = {p.id: Triage() for p in patients}
+            warm_up(patients, processors, triages, 2.0, conn)
 
             rows = storage.processed_since(conn, 0)
             self.assertEqual(len(rows), 3 * WARMUP_SAMPLES)

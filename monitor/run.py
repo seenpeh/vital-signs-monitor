@@ -1,4 +1,4 @@
-"""Live pipeline: simulated sensor -> edge processor -> storage.
+"""Live pipeline: simulated sensor -> edge processor -> triage -> storage.
 
 Every interval, each patient's monitor produces a raw reading, its edge
 processor cleans it and updates the 5-minute stats, and both are saved.
@@ -13,26 +13,31 @@ from monitor import storage
 from monitor.config import REAL_DATA_CSV, SAMPLE_INTERVAL_S
 from monitor.processing import STATS_WINDOW, EdgeProcessor
 from monitor.simulator import make_patients
+from monitor.triage import Triage
 
 WARMUP_SAMPLES = STATS_WINDOW  # 5 minutes of history at start-up
 
 
-def tick(patients, processors, ts, interval_s):
+def tick(patients, processors, triages, ts, interval_s):
     """One reading per patient at time `ts`; returns the rows to save."""
-    readings, processed, events = [], [], []
+    readings, processed, events, alerts = [], [], [], []
     for p in patients:
         reading, event = p.step()
+        clean = processors[p.id].process(reading)
         readings.append({"patient_id": p.id, "ts": ts, **reading})
-        processed.append({"patient_id": p.id, "ts": ts,
-                          **processors[p.id].process(reading)})
+        processed.append({"patient_id": p.id, "ts": ts, **clean})
+        change = triages[p.id].assess(reading, clean)
+        if change:
+            alerts.append({"patient_id": p.id, "ts": ts,
+                           "level": change[0], "reason": change[1]})
         if event:
             events.append({"patient_id": p.id, "kind": event.kind,
                            "vital": event.vital, "start_ts": ts,
                            "end_ts": ts + event.length * interval_s})
-    return readings, processed, events
+    return readings, processed, events, alerts
 
 
-def warm_up(patients, processors, interval_s, conn):
+def warm_up(patients, processors, triages, interval_s, conn):
     """Pre-fill 5 minutes of history, as if monitoring had started earlier.
 
     Without it the dashboard, filter and 5-minute stats need 5 minutes to
@@ -43,9 +48,10 @@ def warm_up(patients, processors, interval_s, conn):
     for p in patients:
         p.p_clinical = p.p_artifact = 0
     start = time.time() - WARMUP_SAMPLES * interval_s
-    rows = ([], [], [])
+    rows = ([], [], [], [])
     for i in range(WARMUP_SAMPLES):
-        new = tick(patients, processors, start + i * interval_s, interval_s)
+        new = tick(patients, processors, triages, start + i * interval_s,
+                   interval_s)
         for all_rows, new_rows in zip(rows, new):
             all_rows.extend(new_rows)
     storage.save(conn, *rows)
@@ -53,11 +59,11 @@ def warm_up(patients, processors, interval_s, conn):
         p.p_clinical, p.p_artifact = clinical, artifact
 
 
-def run(patients, processors, interval_s, conn):
+def run(patients, processors, triages, interval_s, conn):
     """Process one reading per patient every `interval_s` s until Ctrl+C."""
     next_tick = time.monotonic()
     while True:
-        storage.save(conn, *tick(patients, processors, time.time(),
+        storage.save(conn, *tick(patients, processors, triages, time.time(),
                                  interval_s))
         next_tick += interval_s
         time.sleep(max(0.0, next_tick - time.monotonic()))
@@ -87,11 +93,12 @@ def main():
     conn = storage.connect()
     storage.reset(conn)  # each run starts a fresh simulated session
     processors = {p.id: EdgeProcessor() for p in patients}
-    warm_up(patients, processors, args.interval, conn)
+    triages = {p.id: Triage() for p in patients}
+    warm_up(patients, processors, triages, args.interval, conn)
     print(f"Monitoring {len(patients)} patients (5 min of history "
           "pre-filled), Ctrl+C to stop.", flush=True)
     try:
-        run(patients, processors, args.interval, conn)
+        run(patients, processors, triages, args.interval, conn)
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
