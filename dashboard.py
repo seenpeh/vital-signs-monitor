@@ -17,6 +17,33 @@ VITALS = {"hr": "Heart rate (BPM)", "spo2": "SpO2 (%)",
           "sbp": "Systolic BP (mmHg)"}
 LEVEL_COLORS = {"normal": "green", "warning": "orange", "critical": "red"}
 
+# Card animations, pure CSS. The rolling number animates a registered
+# integer property shown through a CSS counter. All motion is skipped
+# when the viewer's system asks for reduced motion.
+CARD_CSS = r"""<style>
+@property --n { syntax: '\3c integer\3e'; initial-value: 0; inherits: false; }
+.vital-label { font-size: 0.875rem; opacity: 0.8; }
+.vital-value { font-size: 2.25rem; line-height: 1.25; }
+.vital-sub { font-size: 0.8rem; opacity: 0.65; margin-bottom: 0.75rem; }
+.roll { --n: var(--to); counter-reset: n var(--n);
+        font-variant-numeric: tabular-nums; }
+.roll::after { content: counter(n); }
+.heart { display: inline-block; color: #e5484d; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden;
+           clip: rect(0 0 0 0); white-space: nowrap; }
+@keyframes roll { from { --n: var(--from); } to { --n: var(--to); } }
+@keyframes beat { 0%, 30%, 100% { transform: scale(1); }
+                  15% { transform: scale(1.35); } }
+@keyframes flash { 50% { box-shadow: 0 0 0 4px rgba(229, 72, 77, 0.5); } }
+@media (prefers-reduced-motion: no-preference) {
+  .roll { animation: roll 0.8s ease-out; }
+  .heart { animation: beat var(--beat) ease-in-out infinite; }
+}
+@media (prefers-reduced-motion: reduce) {
+  [class*="st-key-card_"] { animation: none !important; }
+}
+</style>"""
+
 
 def vital_chart(df, vital, title, domain):
     """Line per patient with the normal range as a shaded band."""
@@ -49,22 +76,48 @@ def fmt(value, digits=1):
     return "—" if pd.isna(value) else f"{value:.{digits}f}"
 
 
+def vital_html(patient_id, vital, label, row):
+    """One vital on a card: label, rolling number, trend and 5-min stats."""
+    value, trend = row[vital], row[f"{vital}_trend"]
+    if pd.isna(value):
+        number = "—"
+    else:
+        new = round(value)
+        # roll from the value shown on the previous refresh
+        old = st.session_state.get(f"{patient_id}_{vital}", new)
+        st.session_state[f"{patient_id}_{vital}"] = new
+        number = (f'<span class="roll" aria-hidden="true" '
+                  f'style="--from:{old};--to:{new}"></span>'
+                  f'<span class="sr-only">{new}</span>')
+    heart = ""
+    if vital == "hr" and not pd.isna(value) and value > 0:
+        # one beat per heartbeat: 60 / BPM seconds
+        heart = (f' <span class="heart" aria-hidden="true" '
+                 f'style="--beat:{60 / value:.2f}s">♥</span>')
+    trend_text = "" if pd.isna(trend) else f"{trend:+.1f}/min · "
+    return (f'<div class="vital-label">{label}{heart}</div>'
+            f'<div class="vital-value">{number}</div>'
+            f'<div class="vital-sub">{trend_text}5 min: '
+            f'{fmt(row[f"{vital}_mean"])} ± {fmt(row[f"{vital}_sd"])}</div>')
+
+
 def show_latest(clean, levels):
     latest = (clean.sort_values("ts").groupby("patient_id").tail(1)
               .sort_values("patient_id"))
+    critical = []
     for col, (_, row) in zip(st.columns(len(latest)), latest.iterrows()):
         level = levels.get(row.patient_id, "normal")  # no alert yet: normal
-        with col.container(border=True):
+        if level == "critical":
+            critical.append(f".st-key-card_{row.patient_id}")
+        with col.container(border=True, key=f"card_{row.patient_id}"):
             st.subheader(f"{row.patient_id} "
                          f":{LEVEL_COLORS[level]}[● {level.title()}]")
-            for vital, label in VITALS.items():
-                trend = row[f"{vital}_trend"]
-                st.metric(label, fmt(row[vital], 0),
-                          delta=(None if pd.isna(trend)
-                                 else f"{trend:+.1f}/min"),
-                          delta_color="off")
-                st.caption(f"5 min: {fmt(row[f'{vital}_mean'])} "
-                           f"± {fmt(row[f'{vital}_sd'])}")
+            st.html("".join(vital_html(row.patient_id, v, label, row)
+                            for v, label in VITALS.items()))
+    if critical:
+        st.html(f"<style>{', '.join(critical)} "
+                "{border-color: #e5484d !important; "
+                "animation: flash 1s ease-in-out infinite;}</style>")
 
 
 def show_alerts(alerts):
@@ -124,5 +177,6 @@ def live_view():
 
 
 st.set_page_config(page_title="Vital Signs Monitor", layout="wide")
+st.html(CARD_CSS)
 st.title("Vital Signs Monitor")
 live_view()
