@@ -48,7 +48,7 @@ monitor/run.py  (one program, one loop every 2 s)
 | Edge processing | `monitor/processing.py` | One `EdgeProcessor` per patient: filters each reading and keeps 5-minute statistics. |
 | Storage | `monitor/storage.py` | SQLite in WAL mode, so the dashboard can read while the pipeline writes. Tables: `readings` (raw), `processed`, `events`. |
 | Pipeline | `monitor/run.py` | Connects the layers. Each layer is its own module and knows nothing about the others. |
-| UI | `dashboard.py` | Streamlit. Refreshes every 2 s and shows the last 5 minutes, raw and cleaned. |
+| UI | `dashboard.py` | Streamlit. Refreshes every 2 s and shows the last 5 minutes, with raw and cleaned data in separate charts. |
 | Config | `monitor/config.py` | Normal ranges, paths and the sampling interval. |
 
 The pipeline and the dashboard are separate processes that share only the database.
@@ -140,6 +140,14 @@ For each vital, over the last 5 minutes of **cleaned** values:
 | Trend | slope of a straight line fitted through the window, in units per minute | `+1.5/min` |
 
 The trend needs at least 1 minute of data, because a slope fitted over a few seconds swings wildly. All values are stored with each processed reading, so the alert engine can use them without recomputing.
+
+## Dashboard
+
+`streamlit run dashboard.py` opens a page that refreshes every 2 s:
+
+- **Patient cards:** the latest cleaned HR, SpO2 and SBP, each with its trend (`+1.5/min`) and its 5-minute mean ± SD. A `—` means there is no reliable value (start-up or probe off).
+- **Charts, one row per vital:** **Raw sensor** on the left and **Cleaned by edge filter** on the right, each showing the last 5 minutes with the normal range shaded green. Both charts in a row share one y scale, so a glitch in the raw chart can be compared directly with the cleaned result. A large raw spike makes the cleaned chart look flatter.
+- **Injected events:** the simulator's ground truth (what it injected and when), for checking the filter and, later, the alerts.
 
 ## Assumptions and design decisions
 
