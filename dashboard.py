@@ -29,6 +29,8 @@ CARD_CSS = r"""<style>
 .vitals { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; }
 .vital-label { font-size: 0.75rem; opacity: 0.8; }
 .vital-value { font-size: 1.6rem; line-height: 1.2; }
+.vital-value.out { color: #e5484d; font-weight: 600; display: inline-block;
+                   transform-origin: left center; }
 .vital-sub { font-size: 0.7rem; opacity: 0.65; }
 .roll { --n: var(--to); counter-reset: n var(--n);
         font-variant-numeric: tabular-nums; }
@@ -39,10 +41,13 @@ CARD_CSS = r"""<style>
 @keyframes roll { from { --n: var(--from); } to { --n: var(--to); } }
 @keyframes beat { 0%, 30%, 100% { transform: scale(1); }
                   15% { transform: scale(1.35); } }
+@keyframes pulse { 0%, 100% { transform: scale(1); }
+                   50% { transform: scale(1.18); } }
 @keyframes flash { 50% { box-shadow: 0 0 0 4px rgba(229, 72, 77, 0.5); } }
 @media (prefers-reduced-motion: no-preference) {
   .roll { animation: roll 0.8s ease-out; }
   .heart { animation: beat var(--beat) ease-in-out infinite; }
+  .vital-value.out { animation: pulse 1s ease-in-out infinite; }
 }
 @media (prefers-reduced-motion: reduce) {
   [class*="st-key-card_"] { animation: none !important; }
@@ -51,19 +56,22 @@ CARD_CSS = r"""<style>
 
 
 def vital_chart(df, vital, domain):
-    """Line per patient with the normal range as a shaded band."""
+    """Line per patient; the normal range is shaded, its limits dashed."""
     low, high = NORMAL_RANGES[vital]
     scale = alt.Scale(domain=domain)
     band = (alt.Chart(pd.DataFrame({"low": [low], "high": [high]}))
             .mark_rect(color="green", opacity=0.08)
             .encode(y=alt.Y("low:Q", scale=scale), y2="high:Q"))
+    limits = (alt.Chart(pd.DataFrame({"y": [low, high]}))
+              .mark_rule(color="#e5484d", strokeDash=[4, 4], opacity=0.8)
+              .encode(y=alt.Y("y:Q", scale=scale)))
     lines = (alt.Chart(df).mark_line()
              .encode(x=alt.X("time:T", title=None,
                              axis=alt.Axis(format="%H:%M:%S")),
                      y=alt.Y(f"{vital}:Q", title=VITALS[vital], scale=scale),
                      color=alt.Color("patient_id:N", title=None,
                                      legend=alt.Legend(orient="top"))))
-    return (band + lines).properties(height=150)
+    return (band + limits + lines).properties(height=210)
 
 
 def show_charts(raw, clean):
@@ -100,9 +108,13 @@ def vital_html(patient_id, vital, label, row):
         # one beat per heartbeat: 60 / BPM seconds
         heart = (f' <span class="heart" aria-hidden="true" '
                  f'style="--beat:{60 / value:.2f}s">♥</span>')
+    low, high = NORMAL_RANGES[vital]
+    out = not pd.isna(value) and not low <= value <= high
+    if out:  # pulses so the problem vital stands out
+        number += '<span class="sr-only"> out of range</span>'
     trend_text = "—" if pd.isna(trend) else f"{trend:+.1f}/min"
     return (f'<div><div class="vital-label">{label}{heart}</div>'
-            f'<div class="vital-value">{number}</div>'
+            f'<div class="vital-value{" out" if out else ""}">{number}</div>'
             f'<div class="vital-sub">{trend_text}<br>5m: '
             f'{fmt(row[f"{vital}_mean"])} ± {fmt(row[f"{vital}_sd"])}</div>'
             '</div>')
@@ -212,7 +224,7 @@ def live_view():
 
     title, button = st.columns([4, 1], vertical_alignment="center")
     title.title("Vital Signs Monitor" + (" — paused" if paused else ""))
-    button.button("▶ Resume (Space)" if paused else "⏸ Pause (Space)",
+    button.button("▶ Resume" if paused else "⏸ Pause",
                   on_click=toggle_pause, shortcut="space",
                   use_container_width=True)
     if not clean_rows:
