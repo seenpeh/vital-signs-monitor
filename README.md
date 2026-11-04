@@ -194,6 +194,8 @@ The detection time adds up from the drop's own onset (about 10 s to cross 90 %),
 
 `streamlit run dashboard.py` opens a page that refreshes every 2 s:
 
+- **Pause / Resume** (button, or the Space key): freezes the simulation, for example to explain a moment during a demo. The pipeline makes no readings while paused, and resumes without a gap in the timestamps.
+
 - **Patient cards:** the current level as a colored badge (🟢 Normal / 🟡 Warning / 🔴 Critical), then the latest cleaned HR, SpO2 and SBP, each with its trend (`+1.5/min`) and its 5-minute mean ± SD. A `—` means there is no reliable value (start-up or probe off). The cards are animated in pure CSS: a ♥ beats at the patient's own heart rate, numbers roll to their new value on each refresh, and a Critical card's border flashes red. All motion is turned off when the viewer's system asks for reduced motion.
 - **Latest alerts:** the 20 most recent level changes, with time, patient, level and reason.
 - **Charts, one row per vital:** **Raw sensor** on the left and **Cleaned by edge filter** on the right, each showing the last 5 minutes with the normal range shaded green. Both charts in a row share one y scale, so a glitch in the raw chart can be compared directly with the cleaned result. A large raw spike makes the cleaned chart look flatter.
