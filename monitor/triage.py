@@ -4,13 +4,14 @@ Rules, on the edge-processed values:
 
 * Warning:  any cleaned vital outside its normal range. The rolling median
             already ignores glitches, so no extra wait is needed.
-* Critical: one of these holds long enough, in a row:
-    - SpO2 < 90 % and the heart rate has risen, for 20 s;
-    - SpO2 < 90 % on its own, for 40 s (prolonged desaturation: catches
-      drops whose HR rise is hidden by an earlier event);
-    - the heart rate has risen and beats irregularly, for 20 s.
-  These waits reject bursts of motion glitches, which pass the filter
-  for at most 18 s and do not raise the heart rate.
+* Critical: one of these holds:
+    - SpO2 < 90 % and the heart rate has risen;
+    - the heart rate has risen and beats irregularly;
+    - SpO2 < 90 % on its own, for 40 s in a row (prolonged desaturation:
+      catches drops whose HR rise is hidden by an earlier event).
+  Only the last rule waits. Bursts of motion glitches pass the filter for
+  up to about 26 s but do not raise the heart rate, so the first two rules
+  need no wait, while SpO2 alone must outlast them.
 
 "Heart rate has risen" means HR > 100 or HR at least HR_JUMP above the
 patient's own 5-minute mean. "Irregular" uses the raw HR: the median jump
@@ -31,7 +32,7 @@ CRITICAL_SPO2 = 90
 HR_HIGH = 100
 HR_JUMP = 10          # BPM above the 5-minute mean
 IRREGULAR_STEP = 3    # BPM, median jump between raw samples
-CONFIRM_SAMPLES = 10  # 20 s
+CONFIRM_SAMPLES = 1    # 2 s: an HR-confirmed crisis needs no wait
 LONG_DESAT_SAMPLES = 20  # 40 s: low SpO2 alone, even without an HR rise
 CALM_SAMPLES = 15     # 30 s
 RHYTHM_WINDOW = 11    # raw HR samples = 10 jumps (20 s)

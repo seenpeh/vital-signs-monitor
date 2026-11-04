@@ -29,9 +29,9 @@ class RuleTest(unittest.TestCase):
         changes = feed(Triage(), [values(spo2=86)] * 18)
         self.assertEqual(changes, [(0, "warning")])
 
-    def test_low_spo2_with_hr_rise_critical_after_20_s(self):
-        changes = feed(Triage(), [values(spo2=86, hr=95, hr_mean=80)] * 10)
-        self.assertEqual(changes, [(0, "warning"), (9, "critical")])
+    def test_low_spo2_with_hr_rise_is_critical_at_once(self):
+        changes = feed(Triage(), [values(spo2=86, hr=105)] * 10)
+        self.assertEqual(changes, [(0, "critical")])
 
     def test_prolonged_low_spo2_alone_critical_after_40_s(self):
         changes = feed(Triage(), [values(spo2=86)] * 20)
@@ -40,7 +40,8 @@ class RuleTest(unittest.TestCase):
     def test_arrhythmia_needs_irregular_beats(self):
         fast = [values(hr=115, hr_mean=80)] * 25
         irregular = [115 + (12 if i % 2 else -12) for i in range(25)]
-        self.assertIn((19, "critical"), feed(Triage(), fast, irregular))
+        # 11 raw samples (10 jumps) are needed to judge the rhythm
+        self.assertIn((10, "critical"), feed(Triage(), fast, irregular))
         steady = feed(Triage(), fast)  # fast but regular: exercise, fever
         self.assertEqual(steady, [(0, "warning")])
 
@@ -88,11 +89,13 @@ class GroundTruthTest(unittest.TestCase):
 
 class ScoreTest(unittest.TestCase):
     def test_caught_covered_missed_pending_and_false(self):
-        crisis = lambda pid, start, end: {"patient_id": pid, "kind":
-                                          "spo2_drop", "start_ts": start,
-                                          "end_ts": end}
-        alert = lambda pid, ts, level: {"patient_id": pid, "ts": ts,
-                                        "level": level}
+        def crisis(pid, start, end):
+            return {"patient_id": pid, "kind": "spo2_drop",
+                    "start_ts": start, "end_ts": end}
+
+        def alert(pid, ts, level):
+            return {"patient_id": pid, "ts": ts, "level": level}
+
         events = [crisis("P1", 100, 200),   # caught 30 s in
                   crisis("P1", 205, 260),   # still Critical: covered
                   crisis("P2", 100, 150),   # no alert: missed

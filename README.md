@@ -148,7 +148,7 @@ real drop:  97 97 97 [85 85 85 85]   → sorted 85 85 85 [85] 97 97 97 → 85  �
 
 Why not a moving average or EMA? An average lets a −40 spike pull the result down for several samples, so glitches leak through and could trigger alarms.
 
-**Known limit:** a *burst* of motion glitches (4 or more within 14 s) looks exactly like the start of a real drop, so it passes the filter. In 27 simulated patient-hours the longest such false low lasted 26 s. The alert engine handles these (see below): a motion glitch does not raise the heart rate, so only the 40 s "low SpO2 alone" rule could fire, while a real desaturation raises HR and lasts until treated. `tests/test_processing.py` checks this guarantee: false lows are always shorter than 40 s, and every real drop is still seen.
+**Known limit:** a *burst* of motion glitches (4 or more within 14 s) looks exactly like the start of a real drop, so it passes the filter. In 27 simulated patient-hours the longest such false low lasted 18 s (26 s in an earlier run with other nurse timings). The alert engine handles these (see below): a motion glitch does not raise the heart rate, so only the 40 s "low SpO2 alone" rule could fire, while a real desaturation raises HR and lasts until treated. `tests/test_processing.py` checks this guarantee: false lows are always shorter than 40 s, and every real drop is still seen.
 
 ### Window statistics (5 minutes)
 
@@ -170,11 +170,11 @@ The trend needs at least 1 minute of data, because a slope fitted over a few sec
 |---|---|
 | 🟢 Normal | every cleaned vital inside its normal range |
 | 🟡 Warning | any cleaned vital outside its normal range (for example HR 101, SpO2 94, SBP 125). The median filter already ignores glitches, so no extra wait is needed. |
-| 🔴 Critical | one of these holds long enough, without a break: **SpO2 < 90 % with an HR rise for 20 s**, **SpO2 < 90 % on its own for 40 s**, or **HR rise with an irregular rhythm for 20 s** |
+| 🔴 Critical | one of these: **SpO2 < 90 % with an HR rise**, **HR rise with an irregular rhythm**, or **SpO2 < 90 % on its own for 40 s in a row** |
 
 - **HR rise:** HR > 100, **or** HR at least 10 BPM above the patient's own 5-minute mean. A patient with a resting HR of 65 who jumps to 90 has risen, even though 90 is "normal".
 - **Irregular rhythm (arrhythmia):** the median jump between consecutive **raw** HR samples over the last 20 s is above 3 BPM. A normal HR never jumps more than 1 BPM per sample; an arrhythmia typically jumps about 10. The median ignores a single glitch. The cleaned HR can't be used here, because the filter smooths the irregularity away. A fast but regular HR (exercise, fever) stays a Warning.
-- **Why the waits:** bursts of motion glitches pass the filter for at most about 26 s and don't raise the heart rate, so 20 s with an HR rise, or 40 s without one, rejects all of them.
+- **Why only one wait:** bursts of motion glitches pass the filter for up to about 26 s but don't raise the heart rate. So a rule that also needs an HR rise can fire at once, and only "SpO2 on its own" must outlast them (40 s). Measured on 27 patient-hours: with no wait on any rule there were 127 false Critical alarms (one per patient every 13 minutes); with the 40 s wait kept, 0. Making the HR-confirmed rules immediate sped up detection from 36 s to 19 s (SpO2 drops) and from 28 s to 10 s (arrhythmia). This relies on the simulator's assumption that motion glitches only corrupt SpO2; a real probe movement can disturb HR too, so a real system would keep a few seconds of confirmation.
 - **Why the 40 s rule:** when a drop follows another event, the earlier event has already raised the 5-minute HR mean, so the compensating rise doesn't stand out. Sustained SpO2 below 90 % is critical on its own.
 
 **Alerts are stored only when a level changes** (`alerts` table: patient, time, level, reason). Going **up** a level is immediate. Going **down** needs the lower level to hold for 30 s, so a value flickering on a limit (SpO2 94 → 95 → 94) doesn't flood the log. Real monitors use the same idea, called an alarm de-escalation delay.
@@ -184,11 +184,11 @@ The trend needs at least 1 minute of data, because a slope fitted over a few sec
 | | Result |
 |---|---|
 | False Critical alarms | **0** |
-| SpO2 drops | 162 in total: 156 raised a new Critical alert (median 36 s after the drop starts), 5 started while the monitor was still Critical from the previous crisis, 1 missed |
-| Arrhythmias | 164 in total: 154 raised a new Critical alert (median 28 s after onset), 10 started while the monitor was still Critical, 0 missed |
-| Crisis duration (closed loop) | 42–128 s (seed 42 also shows up to 144 s); no crisis had to wait for the nurse's 3-minute rounds |
+| SpO2 drops | 153 in total: 140 raised a new Critical alert (median 19 s after the drop starts, at most 58 s), 13 started while the monitor was still Critical from the previous crisis, 0 missed |
+| Arrhythmias | 176 in total: 169 raised a new Critical alert (median 10 s after onset, at most 20 s), 7 started while the monitor was still Critical, 0 missed |
+| Crisis duration (closed loop) | 38–126 s; no crisis had to wait for the nurse's 3-minute rounds |
 
-The detection time adds up from the drop's own onset (about 10 s to cross 90 %), the filter (8 s) and the confirmation (20 s). A crisis that starts during the previous one's 30 s calm-down gets no new alert, because the level never left Critical; the alarm is still on, so the nurse treats it. `tests/test_triage.py` checks each rule, plus "zero false Critical, ≥ 95 % covered" on fresh simulated data, with the nurse in the loop.
+The detection time of a drop adds up from its own onset (about 10 s to cross 90 %) and the filter (8 s). An arrhythmia is judged on the last 20 s of raw HR: once more than half of the jumps are large the median passes 3, which takes about 10 s after the onset. A crisis that starts during the previous one's 30 s calm-down gets no new alert, because the level never left Critical; the alarm is still on, so the nurse treats it. `tests/test_triage.py` checks each rule, plus "zero false Critical, ≥ 95 % covered" on fresh simulated data, with the nurse in the loop.
 
 ## Dashboard
 
@@ -214,7 +214,7 @@ The detection time adds up from the drop's own onset (about 10 s to cross 90 %),
 | Warm-up | Pre-fill 5 minutes of history at start-up, with injected events paused | Without it the charts, the filter and the 5-minute statistics need 5 minutes to fill, which is too slow for a demo. It works as if the patient had been connected 5 minutes earlier. Events are paused so every patient starts stable and no alerts from before start-up appear. Natural noise and real-data spikes still apply. |
 | Warning needs no wait | A cleaned value out of range is a Warning at once | The median filter already needs 4 of 7 readings out of range (8 s), so a single glitch can't trigger it. |
 | HR rise | HR > 100 **or** at least 10 BPM above the 5-minute mean | A fixed limit alone misses patients with a low resting HR; a jump alone misses patients who are already fast. A jump of 15 missed 29 % of drops, because an earlier event inflates the mean. |
-| Arrhythmia | HR rise **and** irregular raw HR, for 20 s | Irregularity is what defines an arrhythmia; a fast regular HR is only a Warning. |
+| Arrhythmia | HR rise **and** irregular raw HR (judged over the last 20 s) | Irregularity is what defines an arrhythmia; a fast regular HR is only a Warning. |
 | Alerts stored | Only when the level changes, with a 30 s delay before going down | Keeps the log readable, and a worsening is never delayed. |
 | Crises act on the level and last until treated | A nurse treats them 15–45 s after the Critical alarm, or after 3 minutes on rounds | A real crisis changes the body and does not end on a timer. Coupling treatment to our own alarm makes detection matter, like on a ward. The recovery speeds are assumptions, chosen to look plausible; AF rate control is compressed from minutes. |
 | One event at a time per patient | Yes | Keeps the ground truth unambiguous. Can be relaxed later to test artefacts that land during a crisis. |
