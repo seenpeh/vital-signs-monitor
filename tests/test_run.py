@@ -2,10 +2,11 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from monitor import storage
 from monitor.processing import EdgeProcessor
-from monitor.run import WARMUP_SAMPLES, tick, warm_up
+from monitor.run import JUMP_SAMPLES, WARMUP_SAMPLES, run, tick, warm_up
 from monitor.simulator import Event, make_patients
 from monitor.triage import Triage
 
@@ -68,6 +69,32 @@ class PauseTest(unittest.TestCase):
             self.assertTrue(storage.is_paused(conn))
             storage.reset(conn)
             self.assertFalse(storage.is_paused(conn))
+            conn.close()
+
+
+class JumpTest(unittest.TestCase):
+    def test_jump_runs_an_hour_and_stamps_treatments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = storage.connect(Path(tmp) / "test.db")
+            patients = make_patients(2, seed=3)
+            args = ({p.id: EdgeProcessor() for p in patients},
+                    {p.id: Triage() for p in patients})
+            storage.request_jump(conn)
+            with patch("monitor.run.time.sleep",
+                       side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    run(patients, *args, 2.0, conn)
+            self.assertFalse(storage.take_jump(conn))  # done once
+            ts = [r["ts"] for r in storage.readings_since(conn, 0)]
+            self.assertEqual(len(ts), 2 * JUMP_SAMPLES)
+            self.assertGreater(max(ts), time.time() + 3500)
+            crises = [e for e in storage.latest_events(conn, limit=-1)
+                      if e["kind"] in ("spo2_drop", "arrhythmia")
+                      and e["end_ts"] is not None]
+            self.assertTrue(crises)
+            for e in crises:  # ended crises were all treated, in between
+                self.assertLessEqual(e["start_ts"], e["treat_ts"])
+                self.assertLess(e["treat_ts"], e["end_ts"])
             conn.close()
 
 

@@ -122,7 +122,7 @@ def simulate(seed, ticks=5400, patients=3):
     triages = {p.id: Triage() for p in ps}
     events, alerts = [], []
     for i in range(ticks):
-        _, _, started, changes, ended = tick(ps, procs, triages, i * 2.0, 2.0)
+        _, _, started, changes, ended, _ = tick(ps, procs, triages, i * 2.0, 2.0)
         events += started
         alerts += changes
         for e in ended:  # like storage.save: close the patient's open events

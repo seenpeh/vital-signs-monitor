@@ -18,11 +18,13 @@ from monitor.simulator import make_patients
 from monitor.triage import ALARM_LEVELS, Triage
 
 WARMUP_SAMPLES = STATS_WINDOW  # 5 minutes of history at start-up
+JUMP_SAMPLES = round(3600 / SAMPLE_INTERVAL_S)  # the dashboard's "+1 hour"
 
 
 def tick(patients, processors, triages, ts, interval_s):
     """One reading per patient at time `ts`; returns the rows to save."""
-    readings, processed, events, alerts, ended = [], [], [], [], []
+    readings, processed, events, alerts, ended, treated = ([] for _ in
+                                                           range(6))
     for p in patients:
         reading, started, stopped = p.step()
         clean = processors[p.id].process(reading)
@@ -42,9 +44,11 @@ def tick(patients, processors, triages, ts, interval_s):
             events.append({"patient_id": p.id, "kind": "spike",
                            "vital": vital, "start_ts": ts,
                            "end_ts": ts + interval_s})
+        if p.treated_now:
+            treated.append({"patient_id": p.id, "treat_ts": ts})
         if stopped:
             ended.append({"patient_id": p.id, "end_ts": ts + interval_s})
-    return readings, processed, events, alerts, ended
+    return readings, processed, events, alerts, ended, treated
 
 
 def warm_up(patients, processors, triages, interval_s, conn):
@@ -58,7 +62,7 @@ def warm_up(patients, processors, triages, interval_s, conn):
     for p in patients:
         p.p_clinical = p.p_artifact = 0
     start = time.time() - WARMUP_SAMPLES * interval_s
-    rows = ([], [], [], [], [])
+    rows = ([], [], [], [], [], [])
     for i in range(WARMUP_SAMPLES):
         new = tick(patients, processors, triages, start + i * interval_s,
                    interval_s)
@@ -73,12 +77,20 @@ def run(patients, processors, triages, interval_s, conn):
     """Process one reading per patient every `interval_s` s until Ctrl+C.
 
     While the dashboard has paused it, nothing is produced, and the paused
-    time is taken out of the timestamps so the recording has no gap.
+    time is taken out of the timestamps so the recording has no gap. A
+    jump runs an hour of ticks at once and shifts the clock an hour ahead.
     """
     next_tick = time.monotonic()
     paused_s = 0.0
     while True:
-        if storage.is_paused(conn):
+        if storage.take_jump(conn):
+            start = time.time() - paused_s
+            for i in range(JUMP_SAMPLES):
+                # saved tick by tick: ended/treated update the open event
+                storage.save(conn, *tick(patients, processors, triages,
+                                         start + i * interval_s, interval_s))
+            paused_s -= JUMP_SAMPLES * interval_s
+        elif storage.is_paused(conn):
             paused_s += interval_s
         else:
             storage.save(conn, *tick(patients, processors, triages,

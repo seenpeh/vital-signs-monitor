@@ -163,19 +163,54 @@ def show_alerts(alerts):
                  height=TABLE_HEIGHT)
 
 
-def show_events(events, title):
+def clock(ts):
+    return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+
+
+def show_events(events, title, columns=()):
     st.markdown(f"**{title}**")
     if not events:
         st.caption("None yet.")
         return
     table = pd.DataFrame(events)
-    table["start"] = [datetime.fromtimestamp(t).strftime("%H:%M:%S")
-                      for t in table.start_ts]
+    table["start"] = [clock(t) for t in table.start_ts]
     table["duration_s"] = ["ongoing" if pd.isna(end) else f"{end - start:.0f}"
                            for start, end in zip(table.start_ts, table.end_ts)]
-    st.dataframe(table[["start", "patient_id", "kind", "vital", "duration_s"]],
+    table["treated"] = ["" if pd.isna(t) else clock(t)
+                        for t in table.treat_ts]
+    st.dataframe(table[["start", "patient_id", "kind", "vital", "duration_s",
+                        *columns]],
                  hide_index=True, use_container_width=True,
                  height=TABLE_HEIGHT)
+
+
+TOAST_MAX = 5  # more new notices than this (a jump): one summary instead
+
+
+def notify(injected):
+    """Toast each injection and each start of treatment, once per viewer.
+
+    The first refresh only marks what is already there as seen.
+    """
+    notices = {(e["patient_id"], e["kind"], e["start_ts"]):
+               f"{e['patient_id']}: {e['kind']} injected at "
+               f"{clock(e['start_ts'])}" for e in injected}
+    notices.update({(e["patient_id"], "treated", e["treat_ts"]):
+                    f"{e['patient_id']}: treatment of {e['kind']} started "
+                    f"at {clock(e['treat_ts'])}"
+                    for e in injected if e["treat_ts"] is not None})
+    seen = st.session_state.get("seen")
+    st.session_state.seen = set(notices)
+    if seen is None:
+        return
+    new = [k for k in notices if k not in seen]
+    if len(new) > TOAST_MAX:
+        treated = sum(k[1] == "treated" for k in new)
+        st.toast(f"{len(new) - treated} injections and {treated} "
+                 "treatments since the last refresh", icon="⏩")
+        return
+    for k in sorted(new, key=lambda k: k[2]):
+        st.toast(notices[k], icon="🩺" if k[1] == "treated" else "💉")
 
 
 def show_score(events, alerts, now):
@@ -208,6 +243,15 @@ def with_time(rows):
     return df
 
 
+def jump_hour():
+    conn = storage.connect()
+    try:
+        storage.request_jump(conn)
+    finally:
+        conn.close()
+    st.toast("Jumping 1 hour ahead…", icon="⏩")
+
+
 def toggle_pause():
     conn = storage.connect()
     try:
@@ -234,8 +278,11 @@ def live_view():
     finally:
         conn.close()
 
-    title, button = st.columns([4, 1], vertical_alignment="center")
+    title, jump, button = st.columns([4, 1, 1], vertical_alignment="center")
     title.title("Vital Signs Monitor" + (" — paused" if paused else ""))
+    jump.button("⏩ +1 hour", on_click=jump_hour,
+                help="Run the next hour of the simulation at once",
+                use_container_width=True)
     button.button("▶ Resume" if paused else "⏸ Pause",
                   on_click=toggle_pause, shortcut="space",
                   use_container_width=True)
@@ -249,11 +296,13 @@ def live_view():
     show_score(events, alerts, now)
     spikes = [e for e in events if e["kind"] == "spike"]
     injected = [e for e in events if e["kind"] != "spike"]
+    notify(injected)
     left, mid, right = st.columns(3)
     with left:
         show_alerts(alerts[:50])
     with mid:
-        show_events(injected[:50], "Injected events (ground truth)")
+        show_events(injected[:50], "Injected events (ground truth)",
+                    ["treated"])
     with right:
         show_events(spikes[:50], "Real-data spikes")
 

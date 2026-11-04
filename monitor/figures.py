@@ -30,7 +30,7 @@ def record(seed, ticks):
     proc, tri = EdgeProcessor(), Triage()
     rows = []
     for i in range(ticks):
-        raw, clean, started, _, _ = tick([p], {p.id: proc}, {p.id: tri},
+        raw, clean, started, _, _, _ = tick([p], {p.id: proc}, {p.id: tri},
                                          i * 2.0, 2.0)
         ev = p.event
         rows.append({"t": i * 2.0, "raw": raw[0], "clean": clean[0],

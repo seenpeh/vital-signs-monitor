@@ -39,12 +39,15 @@ CREATE TABLE IF NOT EXISTS events (
                                -- spo2_dip, dropout, spike
     vital      TEXT,           -- affected vital, for sensor artefacts
     start_ts   REAL NOT NULL,
-    end_ts     REAL            -- NULL while the event is still going on
+    end_ts     REAL,           -- NULL while the event is still going on
+    treat_ts   REAL            -- crises: when treatment started
 );
 
--- Pause switch: the dashboard sets it, the pipeline obeys it.
-CREATE TABLE IF NOT EXISTS control (paused INTEGER NOT NULL);
-INSERT INTO control SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM control);
+-- Pause and jump switches: the dashboard sets them, the pipeline obeys.
+CREATE TABLE IF NOT EXISTS control (paused INTEGER NOT NULL,
+                                    jump INTEGER NOT NULL DEFAULT 0);
+INSERT INTO control (paused) SELECT 0
+    WHERE NOT EXISTS (SELECT 1 FROM control);
 """
 
 
@@ -61,9 +64,9 @@ def connect(path=DB_PATH):
 def reset(conn):
     """Start a fresh session; re-creating the tables applies schema changes."""
     with conn:
-        for table in ("readings", "processed", "alerts", "events"):
+        for table in ("readings", "processed", "alerts", "events",
+                      "control"):
             conn.execute(f"DROP TABLE {table}")
-        conn.execute("UPDATE control SET paused = 0")
     conn.executescript(SCHEMA)
 
 
@@ -76,15 +79,28 @@ def set_paused(conn, paused):
         conn.execute("UPDATE control SET paused = ?", (int(paused),))
 
 
+def request_jump(conn):
+    with conn:
+        conn.execute("UPDATE control SET jump = 1")
+
+
+def take_jump(conn):
+    """True once per jump the dashboard asked for."""
+    with conn:
+        return conn.execute(
+            "UPDATE control SET jump = 0 WHERE jump = 1").rowcount > 0
+
+
 def latest_ts(conn):
     """Time of the newest reading, or None if there are none."""
     return conn.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
 
 
-def save(conn, readings, processed, events, alerts, ended=()):
+def save(conn, readings, processed, events, alerts, ended=(), treated=()):
     """Insert one tick of rows, events and alerts atomically.
 
-    `ended` closes each patient's open event (one at a time per patient).
+    `ended` closes each patient's open event (one at a time per patient);
+    `treated` stamps the start of treatment on it.
     """
     with conn:
         conn.executemany(
@@ -97,9 +113,12 @@ def save(conn, readings, processed, events, alerts, ended=()):
             ":sbp, :sbp_mean, :sbp_sd, :sbp_trend)",
             processed)
         conn.executemany(
-            "INSERT INTO events VALUES "
-            "(:patient_id, :kind, :vital, :start_ts, :end_ts)",
+            "INSERT INTO events (patient_id, kind, vital, start_ts, end_ts) "
+            "VALUES (:patient_id, :kind, :vital, :start_ts, :end_ts)",
             events)
+        conn.executemany(
+            "UPDATE events SET treat_ts = :treat_ts "
+            "WHERE patient_id = :patient_id AND end_ts IS NULL", treated)
         conn.executemany(
             "INSERT INTO alerts VALUES (:patient_id, :ts, :level, :reason)",
             alerts)

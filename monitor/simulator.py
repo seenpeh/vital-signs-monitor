@@ -102,6 +102,7 @@ class Patient:
         self.tick = 0
         self.event = None
         self.spikes = []  # vitals that got a real-data spike this step
+        self.treated_now = False  # treatment of the crisis began this step
 
     def step(self):
         """Advance one sample.
@@ -111,6 +112,7 @@ class Patient:
         rng = self.rng
         started = ended = None
         self.spikes = []
+        self.treated_now = False
         if self.event is None:
             self.event = started = self._maybe_start_event()
         crisis = self.event if self.event and self.event.shift else None
@@ -119,6 +121,8 @@ class Patient:
             self._treat(crisis, 0)  # no alarm came: noticed on rounds
         if crisis and crisis.worsen and crisis.worsen[0] == self.tick:
             started = self._worsen(crisis)
+        if crisis and crisis.treat_tick == self.tick:
+            self.treated_now = True
 
         reading = {}
         for vital, model in self.models.items():
