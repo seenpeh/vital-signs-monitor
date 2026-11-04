@@ -1,2 +1,2 @@
 streamlit>=1.37
-matplotlib  # only for python -m monitor.compare
+matplotlib  # only for the README figures (monitor.compare, monitor.figures)
