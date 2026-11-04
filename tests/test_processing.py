@@ -2,7 +2,6 @@ import unittest
 
 from monitor.processing import EdgeProcessor, rolling_median, window_stats
 from monitor.simulator import make_patients
-from monitor.triage import WINDOW_SAMPLES
 
 
 def run_filter(values):
@@ -57,9 +56,9 @@ class GroundTruthTest(unittest.TestCase):
     """Run hours of simulated data and score the filter on SpO2 <= 91 %.
 
     Bursts of motion dips (4+ glitches within 14 s) do get through the
-    median as short false lows (about 20 s at most), which NEWS2 scores 3;
-    the triage must reject them by persistence (its 30 s window). This test
-    pins down that limit.
+    median as short false lows (about 20 s at most), which NEWS2 scores 3.
+    The triage rises at once, so they become false alarms; a rise window
+    longer than them would reject them. This test pins down that limit.
     """
 
     def test_false_lows_short_and_real_drops_kept(self):
@@ -84,7 +83,7 @@ class GroundTruthTest(unittest.TestCase):
                 else:
                     run = run + 1 if low else 0
                     longest_false = max(longest_false, run)
-        self.assertLess(longest_false, WINDOW_SAMPLES)
+        self.assertLessEqual(longest_false, 10)  # 20 s
         self.assertGreater(len(drops), 20)
         self.assertTrue(all(d["seen"] for d in drops))  # every drop caught
 

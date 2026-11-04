@@ -3,8 +3,8 @@ import unittest
 from monitor.processing import EdgeProcessor
 from monitor.run import tick
 from monitor.simulator import make_patients
-from monitor.triage import (WINDOW_SAMPLES as W, Triage, alarms, held_points,
-                            level_for, points, score)
+from monitor.triage import (CALM_SAMPLES as W, CRISES, GRACE_S, Triage,
+                            alarms, held_points, level_for, points, score)
 
 
 def values(hr=75, spo2=98, sbp=125):
@@ -65,14 +65,15 @@ class ScoringTest(unittest.TestCase):
 
 
 class RuleTest(unittest.TestCase):
-    def test_level_rises_after_30_s(self):
+    def test_level_rises_at_once(self):
         changes = feed(settled(), [values(spo2=88)] * W)
-        self.assertEqual(changes, [(W - 1, "low-medium")])
+        self.assertEqual(changes, [(0, "low-medium")])
 
-    def test_shorter_red_score_never_alarms(self):
+    def test_short_red_score_alarms_then_calms_after_30_s(self):
         # like a burst of motion glitches that got through the filter
-        samples = [values(spo2=88)] * (W - 1) + [values()] * W
-        self.assertEqual(feed(settled(), samples), [])
+        samples = [values(spo2=88)] + [values()] * W
+        self.assertEqual(feed(settled(), samples),
+                         [(0, "low-medium"), (W, "normal")])
 
     def test_glitches_showing_normal_values_do_not_end_an_alarm(self):
         t = settled(spo2=88)
@@ -92,7 +93,7 @@ class RuleTest(unittest.TestCase):
 
     def test_flicker_on_a_limit_gives_one_alert(self):
         flicker = [values(spo2=95), values(spo2=96)] * 20
-        self.assertEqual(feed(Triage(), flicker), [(W - 1, "low")])
+        self.assertEqual(feed(Triage(), flicker), [(0, "low")])
 
     def test_totals(self):
         self.assertEqual(settled(hr=95, sbp=105).level, "low")
@@ -107,11 +108,11 @@ class RuleTest(unittest.TestCase):
         fast = [values(hr=115)] * 30
         irregular = [115 + (12 if i % 2 else -12) for i in range(30)]
         # HR 115 scores 2; from 11 raw samples (10 jumps) on, the rhythm is
-        # irregular and HR scores 3, which must then hold for the window
+        # irregular and HR scores 3
         self.assertEqual(feed(Triage(), fast, irregular),
-                         [(W - 1, "low"), (10 + W - 1, "low-medium")])
+                         [(0, "low"), (10, "low-medium")])
         steady = feed(Triage(), fast)  # fast but regular: exercise, fever
-        self.assertEqual(steady, [(W - 1, "low")])
+        self.assertEqual(steady, [(0, "low")])
 
 
 def simulate(seed, ticks=5400, patients=3):
@@ -135,14 +136,25 @@ def simulate(seed, ticks=5400, patients=3):
 class GroundTruthTest(unittest.TestCase):
     """Score the whole closed loop on 9 simulated patient-hours."""
 
-    def test_no_false_alarm_and_crises_caught(self):
+    def test_crises_caught_and_false_alarms_only_from_artefacts(self):
         events, alerts = simulate(seed=1)
         s = score(events, alerts, now=5400 * 2.0)
         done = s["caught"] + s["covered"] + s["missed"]
-        self.assertEqual(s["false_alarms"], 0)
         self.assertGreater(s["crises"], 50)
         self.assertGreaterEqual((s["caught"] + s["covered"]) / done, 0.95)
         self.assertIn("worsening", {e["kind"] for e in events})
+        # the level rises at once, so a glitch burst that gets through the
+        # filter raises a false alarm; a stable patient's drift never does
+        for a in alarms(alerts):
+            mine = [e for e in events if e["patient_id"] == a["patient_id"]]
+            in_crisis = any(
+                e["kind"] in CRISES and e["start_ts"] <= a["ts"] <=
+                (e["end_ts"] if e["end_ts"] is not None else a["ts"])
+                + GRACE_S for e in mine)
+            glitch = any(e["kind"] in ("spo2_dip", "dropout")
+                         and a["ts"] - 30 <= e["start_ts"] <= a["ts"]
+                         for e in mine)
+            self.assertTrue(in_crisis or glitch, a)
 
 
 class ScoreTest(unittest.TestCase):

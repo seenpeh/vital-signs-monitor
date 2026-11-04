@@ -64,8 +64,7 @@ TREAT_FACTOR = {"low-medium": 1.0, "medium": 1.5, "high": 2.0}
 # times as deep, and SBP falls, while the nurse keeps treating.
 P_WORSEN = 0.25              # share of treatments that meet one
 WORSEN_AFTER_S = (2, 20)     # from the start of treatment
-WORSEN_S = (30, 60)          # how long the disease pulls; >= the 30 s alarm
-                             # window, or the monitor could never see it
+WORSEN_S = (30, 60)          # how long the disease pulls
 WORSE = 2
 WORSEN_SBP_DROP = (15, 25)   # mmHg
 HR_MAX = 180                 # BPM; rapid AF rarely goes faster

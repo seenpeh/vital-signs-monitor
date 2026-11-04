@@ -22,15 +22,19 @@ Level, from NEWS2's clinical risk bands:
     medium      total 5-6                 > alarm: the nurse is called
     high        total 7 or more          /
 
-Two guards against false alarms:
+The level rises at once: the filter has already held the change for 8 s.
+It falls only with two guards, so an alarm doesn't flicker off:
 
 * hysteresis, per vital: points go up as soon as a band is entered, but
   come down only once the value is MARGIN clear of the band edge (HR scores
   1 from 91 BPM, and is back to 0 only at 85 or below);
-* a time window (complex event processing): the level moves, up or down,
-  only to a level that held for all of the last WINDOW_SAMPLES (30 s).
-  A burst of glitches that gets through the filter (up to ~26 s) cannot
-  raise an alarm, and one that shows normal values cannot end one.
+* a time window (complex event processing): the level steps down only to
+  a level that held for all of the last CALM_SAMPLES (30 s), so glitches
+  that show normal values cannot end an alarm.
+
+shortcut: a burst of motion glitches that gets through the filter (up to
+~20 s) raises a false alarm; a rise window of 24 s would reject them all
+in our runs, at the cost of alarms about 22 s later.
 """
 import statistics
 from collections import deque
@@ -45,7 +49,7 @@ BANDS = {
     "sbp": ((91, 2), (101, 1), (111, 0), (220, 3)),
 }
 MARGIN = {"hr": 5, "spo2": 1, "sbp": 5}  # hysteresis, in each vital's unit
-WINDOW_SAMPLES = 15   # 30 s a level must hold before the monitor moves
+CALM_SAMPLES = 15     # 30 s a lower level must hold to step down
 IRREGULAR_STEP = 3    # BPM, median jump between raw samples
 RHYTHM_WINDOW = 11    # raw HR samples = 10 jumps (20 s)
 
@@ -97,7 +101,7 @@ class Triage:
         self.level = "normal"
         self.scores = dict.fromkeys(BANDS, 0)  # with hysteresis
         self.raw_hr = deque(maxlen=RHYTHM_WINDOW)
-        self.recent = deque(maxlen=WINDOW_SAMPLES)  # instant level ranks
+        self.recent = deque(maxlen=CALM_SAMPLES)  # instant level ranks
 
     def assess(self, raw, p):
         """Return (new level, reason) if the level changed, else None."""
@@ -110,12 +114,11 @@ class Triage:
         if arrhythmia:
             scores["hr"] = 3
         self.recent.append(LEVELS.index(level_for(scores)))
-        if len(self.recent) < WINDOW_SAMPLES:
-            return None
         rank = LEVELS.index(self.level)
-        if min(self.recent) > rank:    # worse for the whole window
-            rank = min(self.recent)
-        elif max(self.recent) < rank:  # better for the whole window
+        if self.recent[-1] > rank:  # worse: at once
+            rank = self.recent[-1]
+        elif (len(self.recent) == CALM_SAMPLES
+              and max(self.recent) < rank):  # better for the whole 30 s
             rank = max(self.recent)
         else:
             return None
@@ -172,12 +175,13 @@ def score(events, alerts, now):
         used.update(hits)
         before = [a for a in alerts if a["patient_id"] == c["patient_id"]
                   and a["ts"] < c["start_ts"]]
-        if hits:
-            out["caught"] += 1
-            delays.append(raised[hits[0]]["ts"] - c["start_ts"])
-        elif before and max(before, key=lambda a: a["ts"])["level"] in \
+        # already alarming: covered, even if it re-alarms later
+        if before and max(before, key=lambda a: a["ts"])["level"] in \
                 ALARM_LEVELS:
             out["covered"] += 1
+        elif hits:
+            out["caught"] += 1
+            delays.append(raised[hits[0]]["ts"] - c["start_ts"])
         elif c["end_ts"] is None or now <= until:
             out["pending"] += 1
         else:
