@@ -111,7 +111,7 @@ reading  = round(reading)                              # monitors report whole n
 | `spo2_dip` | SpO2 falsely drops 10–20 points (probe motion) | 1–3 samples | No, filter it out |
 | `dropout` | One vital sends nothing (probe off) | 2–5 samples | No |
 
-Each patient averages one clinical event every 3 minutes and one artefact every 30 seconds, one event at a time. The real case has no SpO2 spikes, but motion-induced SpO2 drops are the classic false alarm, so we inject them to test the filter. The natural HR and SBP spikes from the real data are background texture and are not logged.
+Each patient averages one clinical event every 3 minutes and one artefact every 30 seconds, one event at a time. The real case has no SpO2 spikes, but motion-induced SpO2 drops are the classic false alarm, so we inject them to test the filter. The natural HR and SBP spikes from the real data are logged too, as one-sample `spike` events, so the dashboard can show what the filter had to remove.
 
 **Crises change the body, artefacts only the reading.** A crisis moves the patient's slow `level` (the same random walk as above) toward a crisis target, and the level comes back only once the crisis is treated. Each phase has its own speed, as a time constant (how long the level takes to cover most of the gap):
 
@@ -197,9 +197,9 @@ The detection time adds up from the drop's own onset (about 10 s to cross 90 %),
 - **Pause / Resume** (button, or the Space key): freezes the simulation, for example to explain a moment during a demo. The pipeline makes no readings while paused, and resumes without a gap in the timestamps.
 
 - **Patient cards:** the current level as a colored badge (🟢 Normal / 🟡 Warning / 🔴 Critical), then the latest cleaned HR, SpO2 and SBP, each with its trend (`+1.5/min`) and its 5-minute mean ± SD. A `—` means there is no reliable value (start-up or probe off). The cards are animated in pure CSS: a ♥ beats at the patient's own heart rate, numbers roll to their new value on each refresh, and a Critical card's border flashes red. All motion is turned off when the viewer's system asks for reduced motion.
-- **Latest alerts:** the 20 most recent level changes, with time, patient, level and reason.
-- **Charts, one row per vital:** **Raw sensor** on the left and **Cleaned by edge filter** on the right, each showing the last 5 minutes with the normal range shaded green. Both charts in a row share one y scale, so a glitch in the raw chart can be compared directly with the cleaned result. A large raw spike makes the cleaned chart look flatter.
-- **Injected events:** the simulator's ground truth (what it injected and when), for checking the filter and the alerts. A crisis shows as `ongoing` until the nurse has treated it.
+- **Charts:** a **Raw sensor** row above a **Cleaned by edge filter** row, one column per vital, each showing the last 5 minutes with the normal range shaded green. A vital's raw and cleaned charts share one y scale, so a glitch in the raw chart can be compared directly with the cleaned result. A large raw spike makes the cleaned chart look flatter. The cards and both chart rows fit on the first screen.
+- **Alert & triage accuracy:** a live score of the Critical alerts against the simulator's ground truth: crises so far, the share detected (a new Critical alert, or the monitor already Critical when the crisis started), missed crises, false Critical alarms, the median time from crisis start to Critical, and how many artefacts and spikes it had to ignore. A Critical alert up to 40 s after a crisis ends still counts for that crisis (filter and confirmation delay).
+- **Tables:** the latest alerts (level changes with reason), the injected events (the simulator's ground truth; a crisis shows as `ongoing` until the nurse has treated it) and the real-data spikes.
 
 ## Assumptions and design decisions
 

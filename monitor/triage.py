@@ -116,3 +116,43 @@ class Triage:
             return None
         self.level, self.calm_run = self.calm_peak, 0
         return self.level, reason if self.level == level else "improving"
+
+
+CRISES = ("spo2_drop", "arrhythmia")
+GRACE_S = 40  # a Critical this long after a crisis ends still belongs to it
+
+
+def score(events, alerts, now):
+    """Grade Critical alerts against the simulator's ground truth.
+
+    A crisis is caught by a Critical alert between its start and GRACE_S
+    after its end, or covered if the monitor was already Critical when it
+    started. A Critical alert outside every crisis is false.
+    """
+    crit = sorted((a for a in alerts if a["level"] == "critical"),
+                  key=lambda a: a["ts"])
+    crises = [e for e in events if e["kind"] in CRISES]
+    used, delays = set(), []
+    out = {"crises": len(crises), "caught": 0, "covered": 0, "missed": 0,
+           "pending": 0}
+    for c in crises:
+        until = (c["end_ts"] if c["end_ts"] is not None else now) + GRACE_S
+        hits = [i for i, a in enumerate(crit) if a["patient_id"] ==
+                c["patient_id"] and c["start_ts"] <= a["ts"] <= until]
+        used.update(hits)
+        before = [a for a in alerts if a["patient_id"] == c["patient_id"]
+                  and a["ts"] < c["start_ts"]]
+        if hits:
+            out["caught"] += 1
+            delays.append(crit[hits[0]]["ts"] - c["start_ts"])
+        elif before and max(before, key=lambda a: a["ts"])["level"] == \
+                "critical":
+            out["covered"] += 1
+        elif c["end_ts"] is None or now <= until:
+            out["pending"] += 1
+        else:
+            out["missed"] += 1
+    out["false_critical"] = len(crit) - len(used)
+    out["median_delay_s"] = statistics.median(delays) if delays else None
+    out["artefacts"] = sum(e["kind"] not in CRISES for e in events)
+    return out

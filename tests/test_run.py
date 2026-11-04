@@ -24,7 +24,9 @@ class WarmUpTest(unittest.TestCase):
             rows = storage.processed_since(conn, 0)
             self.assertEqual(len(rows), 3 * WARMUP_SAMPLES)
             self.assertLess(max(r["ts"] for r in rows), time.time())
-            self.assertEqual(storage.latest_events(conn), [])  # stable start
+            # stable start: only the real-data spikes, nothing injected
+            self.assertEqual({e["kind"] for e in storage.latest_events(conn)},
+                             {"spike"})
             last = rows[-1]
             self.assertIsNotNone(last["spo2"])        # filter is full
             self.assertIsNotNone(last["spo2_trend"])  # stats are ready

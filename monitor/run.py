@@ -38,6 +38,10 @@ def tick(patients, processors, triages, ts, interval_s):
             events.append({"patient_id": p.id, "kind": started.kind,
                            "vital": started.vital, "start_ts": ts,
                            "end_ts": None})
+        for vital in p.spikes:  # one-sample glitch, logged as ground truth
+            events.append({"patient_id": p.id, "kind": "spike",
+                           "vital": vital, "start_ts": ts,
+                           "end_ts": ts + interval_s})
         if stopped:
             ended.append({"patient_id": p.id, "end_ts": ts + interval_s})
     return readings, processed, events, alerts, ended

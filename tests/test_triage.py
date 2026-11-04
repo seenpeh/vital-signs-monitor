@@ -2,7 +2,7 @@ import unittest
 
 from monitor.processing import EdgeProcessor
 from monitor.simulator import make_patients
-from monitor.triage import CALM_SAMPLES, Triage
+from monitor.triage import CALM_SAMPLES, Triage, score
 
 
 def values(hr=75, spo2=97, sbp=110, hr_mean=75):
@@ -84,6 +84,29 @@ class GroundTruthTest(unittest.TestCase):
         self.assertEqual(false_critical, 0)
         self.assertGreater(len(crises), 50)
         self.assertGreaterEqual(caught / len(crises), 0.95)
+
+
+class ScoreTest(unittest.TestCase):
+    def test_caught_covered_missed_pending_and_false(self):
+        crisis = lambda pid, start, end: {"patient_id": pid, "kind":
+                                          "spo2_drop", "start_ts": start,
+                                          "end_ts": end}
+        alert = lambda pid, ts, level: {"patient_id": pid, "ts": ts,
+                                        "level": level}
+        events = [crisis("P1", 100, 200),   # caught 30 s in
+                  crisis("P1", 205, 260),   # still Critical: covered
+                  crisis("P2", 100, 150),   # no alert: missed
+                  crisis("P3", 900, None),  # just started: pending
+                  {"patient_id": "P2", "kind": "spike", "start_ts": 500,
+                   "end_ts": 502}]
+        alerts = [alert("P1", 130, "critical"),
+                  alert("P2", 600, "critical")]  # no crisis: false
+        s = score(events, alerts, now=910)
+        self.assertEqual((s["crises"], s["caught"], s["covered"],
+                          s["missed"], s["pending"]), (4, 1, 1, 1, 1))
+        self.assertEqual(s["false_critical"], 1)
+        self.assertEqual(s["median_delay_s"], 30)
+        self.assertEqual(s["artefacts"], 1)
 
 
 if __name__ == "__main__":

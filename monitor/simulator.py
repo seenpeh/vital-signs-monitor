@@ -81,6 +81,7 @@ class Patient:
         self.p_artifact = SAMPLE_INTERVAL_S / ARTIFACT_EVERY_S
         self.tick = 0
         self.event = None
+        self.spikes = []  # vitals that got a real-data spike this step
 
     def step(self):
         """Advance one sample.
@@ -89,6 +90,7 @@ class Patient:
         """
         rng = self.rng
         started = ended = None
+        self.spikes = []
         if self.event is None:
             self.event = started = self._maybe_start_event()
         crisis = self.event if self.event and self.event.shift else None
@@ -106,6 +108,7 @@ class Patient:
             reading[vital] = self.level[vital] + rng.gauss(0, model.jitter_sd)
             if model.spike_sizes and rng.random() < model.spike_rate:
                 reading[vital] += rng.choice(model.spike_sizes)  # a real one
+                self.spikes.append(vital)
 
         if self.event:
             self._apply(self.event, reading)
