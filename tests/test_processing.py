@@ -2,7 +2,7 @@ import unittest
 
 from monitor.processing import EdgeProcessor, rolling_median, window_stats
 from monitor.simulator import make_patients
-from monitor.triage import LONG_DESAT_SAMPLES
+from monitor.triage import WINDOW_SAMPLES
 
 
 def run_filter(values):
@@ -54,11 +54,12 @@ class WindowStatsTest(unittest.TestCase):
 
 
 class GroundTruthTest(unittest.TestCase):
-    """Run hours of simulated data and score the filter on SpO2 < 90 %.
+    """Run hours of simulated data and score the filter on SpO2 <= 91 %.
 
     Bursts of motion dips (4+ glitches within 14 s) do get through the
-    median as short false lows (about 20 s at most); the triage must reject
-    them by persistence and heart rate. This test pins down that limit.
+    median as short false lows (about 20 s at most), which NEWS2 scores 3;
+    the triage must reject them by persistence (its 30 s window). This test
+    pins down that limit.
     """
 
     def test_false_lows_short_and_real_drops_kept(self):
@@ -75,7 +76,7 @@ class GroundTruthTest(unittest.TestCase):
                     left = float("inf")  # no nurse here: lasts until rounds
                 if ended and ended.kind == "spo2_drop":
                     left = 4  # filter recovery time
-                low = clean is not None and clean < 90
+                low = clean is not None and clean <= 91
                 if left > 0:
                     drop["seen"] = drop["seen"] or low
                     left -= 1
@@ -83,8 +84,7 @@ class GroundTruthTest(unittest.TestCase):
                 else:
                     run = run + 1 if low else 0
                     longest_false = max(longest_false, run)
-        # glitches don't raise HR, so only the 40 s low-SpO2 rule applies
-        self.assertLess(longest_false, LONG_DESAT_SAMPLES)
+        self.assertLess(longest_false, WINDOW_SAMPLES)
         self.assertGreater(len(drops), 20)
         self.assertTrue(all(d["seen"] for d in drops))  # every drop caught
 

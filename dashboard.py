@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from monitor import storage
-from monitor.triage import score
+from monitor.triage import ALARM_LEVELS, score
 from monitor.config import NORMAL_RANGES, SAMPLE_INTERVAL_S
 
 WINDOW_S = 5 * 60  # how much history the charts show
@@ -18,7 +18,9 @@ VITALS = {"hr": "Heart rate (BPM)", "spo2": "SpO2 (%)",
           "sbp": "Systolic BP (mmHg)"}
 SHORT = {"hr": "HR (BPM)", "spo2": "SpO2 (%)", "sbp": "SBP (mmHg)"}
 TABLE_HEIGHT = 250
-LEVEL_COLORS = {"normal": "green", "warning": "orange", "critical": "red"}
+LEVEL_COLORS = {"normal": "green", "low": "yellow", "low-medium": "orange",
+                "medium": "orange", "high": "red"}
+NEAR = 40  # a range limit further than this from the data stays off the axis
 
 # Card animations, pure CSS. The rolling number animates a registered
 # integer property shown through a CSS counter. All motion is skipped
@@ -75,10 +77,17 @@ def vital_chart(df, vital, domain):
 
 
 def show_charts(raw, clean):
-    """Raw row above cleaned row; each vital's column shares one y scale."""
-    domains = {v: [min(raw[v].min(), clean[v].min(), NORMAL_RANGES[v][0]),
-                   max(raw[v].max(), clean[v].max(), NORMAL_RANGES[v][1])]
-               for v in VITALS}
+    """Raw row above cleaned row; each vital's column shares one y scale.
+
+    The scale reaches the range limits, unless one is far from the data:
+    SBP's 219 would flatten the chart.
+    """
+    domains = {}
+    for v, (low, high) in NORMAL_RANGES.items():
+        lo = min(raw[v].min(), clean[v].min())
+        hi = max(raw[v].max(), clean[v].max())
+        domains[v] = [min(lo, low) if lo - low < NEAR else lo,
+                      max(hi, high) if high - hi < NEAR else hi]
     for title, df in (("Raw sensor", raw), ("Cleaned by edge filter", clean)):
         st.markdown(f"**{title}**")
         for col, vital in zip(st.columns(len(VITALS)), VITALS):
@@ -123,19 +132,20 @@ def vital_html(patient_id, vital, label, row):
 def show_latest(clean, levels):
     latest = (clean.sort_values("ts").groupby("patient_id").tail(1)
               .sort_values("patient_id"))
-    critical = []
+    alarming = []
     for col, (_, row) in zip(st.columns(len(latest)), latest.iterrows()):
         level = levels.get(row.patient_id, "normal")  # no alert yet: normal
-        if level == "critical":
-            critical.append(f".st-key-card_{row.patient_id}")
+        if level in ALARM_LEVELS:
+            alarming.append(f".st-key-card_{row.patient_id}")
+        label = level.capitalize() + ("" if level == "normal" else " risk")
         with col.container(border=True, key=f"card_{row.patient_id}"):
             st.markdown(f"**{row.patient_id}** "
-                        f":{LEVEL_COLORS[level]}[● {level.title()}]")
+                        f":{LEVEL_COLORS[level]}[● {label}]")
             st.html('<div class="vitals">'
                     + "".join(vital_html(row.patient_id, v, label, row)
                               for v, label in SHORT.items()) + "</div>")
-    if critical:
-        st.html(f"<style>{', '.join(critical)} "
+    if alarming:
+        st.html(f"<style>{', '.join(alarming)} "
                 "{border-color: #e5484d !important; "
                 "animation: flash 1s ease-in-out infinite;}</style>")
 
@@ -176,15 +186,17 @@ def show_score(events, alerts, now):
     delay = s["median_delay_s"]
     cols = st.columns(6)
     cols[0].metric("Crises", s["crises"],
-                   help="SpO2 drops and arrhythmias injected so far")
+                   help="SpO2 drops, arrhythmias and worsenings during "
+                        "treatment, injected so far")
     cols[1].metric("Detected", f"{(s['caught'] + s['covered']) / done:.0%}"
                    if done else "—",
-                   help="New Critical alert, or monitor already Critical "
-                        "when the crisis started. Ongoing crises excluded.")
+                   help="New alarm (the level rises to low-medium or "
+                        "above), or monitor already alarming when the "
+                        "crisis started. Ongoing crises excluded.")
     cols[2].metric("Missed", s["missed"])
-    cols[3].metric("False Critical", s["false_critical"],
-                   help="Critical alerts with no crisis behind them")
-    cols[4].metric("Time to Critical",
+    cols[3].metric("False alarms", s["false_alarms"],
+                   help="Alarms with no crisis behind them")
+    cols[4].metric("Time to alarm",
                    "—" if delay is None else f"{delay:.0f} s")
     cols[5].metric("Artefacts & spikes", s["artefacts"],
                    help="Sensor glitches the engine must not alarm on")

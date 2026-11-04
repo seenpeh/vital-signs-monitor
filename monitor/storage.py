@@ -28,14 +28,15 @@ CREATE INDEX IF NOT EXISTS processed_by_time ON processed (ts);
 CREATE TABLE IF NOT EXISTS alerts (
     patient_id TEXT NOT NULL,
     ts         REAL NOT NULL,
-    level      TEXT NOT NULL,  -- normal, warning, critical
+    level      TEXT NOT NULL,  -- normal, low, low-medium, medium, high
     reason     TEXT NOT NULL
 );
 
 -- Ground truth of what the simulator injected, for checking the detector.
 CREATE TABLE IF NOT EXISTS events (
     patient_id TEXT NOT NULL,
-    kind       TEXT NOT NULL,  -- spo2_drop, arrhythmia, spo2_dip, dropout
+    kind       TEXT NOT NULL,  -- spo2_drop, arrhythmia, worsening,
+                               -- spo2_dip, dropout, spike
     vital      TEXT,           -- affected vital, for sensor artefacts
     start_ts   REAL NOT NULL,
     end_ts     REAL            -- NULL while the event is still going on

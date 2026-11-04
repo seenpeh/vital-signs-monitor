@@ -44,7 +44,7 @@ class FitTest(unittest.TestCase):
 class PatientTest(unittest.TestCase):
     def quiet_patient(self):
         p = Patient("P1", MODELS, random.Random(0))
-        p.p_clinical = p.p_artifact = 0  # no injected events
+        p.p_clinical = p.p_artifact = p.p_worsen = 0  # no injected events
         return p
 
     def test_same_seed_same_readings(self):
@@ -86,15 +86,49 @@ class PatientTest(unittest.TestCase):
         self.crisis(p, "arrhythmia", hr=60)
         for _ in range(10):
             p.step()
-        p.alarm()
+        p.alarm("low-medium")
         treat = p.event.treat_tick - p.tick
         low, high = (s / SAMPLE_INTERVAL_S for s in NURSE_REACTION_S)
         self.assertTrue(low <= treat <= high)
-        p.alarm()  # a second alarm doesn't call the nurse again
+        p.alarm("low-medium")  # a second alarm doesn't call the nurse again
         self.assertEqual(p.event.treat_tick - p.tick, treat)
         ends = [p.step()[2] for _ in range(100)]
         self.assertIsNotNone(next(e for e in ends if e))
         self.assertLess(abs(p.level["hr"] - p.baseline["hr"]), 13)
+
+    def recovery_samples(self, level):
+        p = self.quiet_patient()
+        self.crisis(p, "spo2_drop", spo2=-12, hr=20)
+        for _ in range(10):
+            p.step()
+        p.alarm(level)
+        return next(i for i in range(300) if p.step()[2])
+
+    def test_worse_alarm_level_treats_faster(self):
+        self.assertLess(self.recovery_samples("high"),
+                        self.recovery_samples("low-medium"))
+
+    def test_complication_worsens_the_patient_during_treatment(self):
+        p = self.quiet_patient()
+        p.p_worsen = 1
+        self.crisis(p, "spo2_drop", spo2=-12, hr=20)
+        for _ in range(10):
+            p.step()
+        p.alarm("low-medium")
+        treat_tick = p.event.treat_tick
+        start, end = p.event.worsen
+        while p.tick < start:
+            p.step()
+        before = p.level["spo2"]  # treatment has been lifting it
+        self.assertEqual(p.step()[1].kind, "worsening")
+        while p.tick < end:
+            p.alarm("low-medium")  # the monitor is still alarming
+            p.step()
+        self.assertEqual(p.event.treat_tick, treat_tick)  # no new wait
+        self.assertLess(p.level["spo2"], before)  # worse despite treatment
+        self.assertLess(p.level["sbp"], p.baseline["sbp"] - 8)
+        ended = next(e for e in (p.step()[2] for _ in range(200)) if e)
+        self.assertEqual(ended.kind, "spo2_drop")  # then recovers
 
     def test_arrhythmia_is_fast_and_irregular(self):
         p = self.quiet_patient()

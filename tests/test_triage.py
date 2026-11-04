@@ -1,12 +1,14 @@
 import unittest
 
 from monitor.processing import EdgeProcessor
+from monitor.run import tick
 from monitor.simulator import make_patients
-from monitor.triage import CALM_SAMPLES, Triage, score
+from monitor.triage import (WINDOW_SAMPLES as W, Triage, alarms, held_points,
+                            level_for, points, score)
 
 
-def values(hr=75, spo2=97, sbp=110, hr_mean=75):
-    return {"hr": hr, "hr_mean": hr_mean, "spo2": spo2, "sbp": sbp}
+def values(hr=75, spo2=98, sbp=125):
+    return {"hr": hr, "spo2": spo2, "sbp": sbp}
 
 
 def feed(triage, samples, raw_hr=None):
@@ -20,71 +22,127 @@ def feed(triage, samples, raw_hr=None):
     return changes
 
 
+def settled(**vitals):
+    """A Triage that has seen a full window of these values."""
+    t = Triage()
+    feed(t, [values(**vitals)] * W)
+    return t
+
+
+class ScoringTest(unittest.TestCase):
+    def test_news2_bands(self):
+        cases = {"hr": [(40, 3), (41, 1), (50, 1), (51, 0), (90, 0), (91, 1),
+                        (110, 1), (111, 2), (130, 2), (131, 3)],
+                 "spo2": [(91, 3), (92, 2), (93, 2), (94, 1), (95, 1),
+                          (96, 0), (100, 0)],
+                 "sbp": [(90, 3), (91, 2), (100, 2), (101, 1), (110, 1),
+                         (111, 0), (219, 0), (220, 3)]}
+        for vital, pairs in cases.items():
+            for value, expected in pairs:
+                self.assertEqual(points(vital, value), expected,
+                                 (vital, value))
+
+    def test_hysteresis_scores_up_at_once_and_down_past_a_margin(self):
+        self.assertEqual(held_points("hr", 91, 0), 1)
+        self.assertEqual(held_points("hr", 88, 1), 1)  # back in 51-90, close
+        self.assertEqual(held_points("hr", 85, 1), 0)  # 5 BPM clear
+        self.assertEqual(held_points("hr", 128, 3), 3)
+        self.assertEqual(held_points("hr", 125, 3), 2)
+        self.assertEqual(held_points("spo2", 96, 1), 1)
+        self.assertEqual(held_points("spo2", 97, 1), 0)
+        self.assertEqual(held_points("spo2", None, 3), 3)  # probe off
+
+    def test_levels(self):
+        def level(hr, spo2, sbp):
+            return level_for({"hr": hr, "spo2": spo2, "sbp": sbp})
+
+        self.assertEqual(level(0, 0, 0), "normal")
+        self.assertEqual(level(1, 2, 1), "low")
+        self.assertEqual(level(0, 3, 0), "low-medium")  # a single 3
+        self.assertEqual(level(1, 3, 1), "medium")
+        self.assertEqual(level(2, 2, 2), "medium")
+        self.assertEqual(level(3, 3, 1), "high")
+
+
 class RuleTest(unittest.TestCase):
-    def test_out_of_range_is_an_immediate_warning(self):
-        self.assertEqual(feed(Triage(), [values(hr=101)]), [(0, "warning")])
+    def test_level_rises_after_30_s(self):
+        changes = feed(settled(), [values(spo2=88)] * W)
+        self.assertEqual(changes, [(W - 1, "low-medium")])
 
-    def test_short_low_spo2_without_hr_rise_is_only_warning(self):
+    def test_shorter_red_score_never_alarms(self):
         # like a burst of motion glitches that got through the filter
-        changes = feed(Triage(), [values(spo2=86)] * 18)
-        self.assertEqual(changes, [(0, "warning")])
+        samples = [values(spo2=88)] * (W - 1) + [values()] * W
+        self.assertEqual(feed(settled(), samples), [])
 
-    def test_low_spo2_with_hr_rise_is_critical_at_once(self):
-        changes = feed(Triage(), [values(spo2=86, hr=105)] * 10)
-        self.assertEqual(changes, [(0, "critical")])
+    def test_glitches_showing_normal_values_do_not_end_an_alarm(self):
+        t = settled(spo2=88)
+        self.assertEqual(t.level, "low-medium")
+        samples = [values()] * 4 + [values(spo2=88)] * W
+        self.assertEqual(feed(t, samples), [])
 
-    def test_prolonged_low_spo2_alone_critical_after_40_s(self):
-        changes = feed(Triage(), [values(spo2=86)] * 20)
-        self.assertEqual(changes, [(0, "warning"), (19, "critical")])
+    def test_level_falls_after_30_s(self):
+        changes = feed(settled(spo2=88), [values()] * W)
+        self.assertEqual(changes, [(W - 1, "normal")])
 
-    def test_arrhythmia_needs_irregular_beats(self):
-        fast = [values(hr=115, hr_mean=80)] * 25
-        irregular = [115 + (12 if i % 2 else -12) for i in range(25)]
-        # 11 raw samples (10 jumps) are needed to judge the rhythm
-        self.assertIn((10, "critical"), feed(Triage(), fast, irregular))
-        steady = feed(Triage(), fast)  # fast but regular: exercise, fever
-        self.assertEqual(steady, [(0, "warning")])
-
-    def test_calms_down_only_after_30_s(self):
-        t = Triage()
-        feed(t, [values(hr=101)])
-        changes = feed(t, [values()] * CALM_SAMPLES)
-        self.assertEqual(changes, [(CALM_SAMPLES - 1, "normal")])
+    def test_value_near_the_edge_keeps_its_points(self):
+        t = settled(hr=95)
+        self.assertEqual(t.level, "low")
+        self.assertEqual(feed(t, [values(hr=88)] * 2 * W), [])
+        self.assertEqual(feed(t, [values(hr=84)] * W), [(W - 1, "normal")])
 
     def test_flicker_on_a_limit_gives_one_alert(self):
-        flicker = [values(spo2=94), values(spo2=95)] * 20
-        self.assertEqual(feed(Triage(), flicker), [(0, "warning")])
+        flicker = [values(spo2=95), values(spo2=96)] * 20
+        self.assertEqual(feed(Triage(), flicker), [(W - 1, "low")])
+
+    def test_totals(self):
+        self.assertEqual(settled(hr=95, sbp=105).level, "low")
+        self.assertEqual(settled(spo2=88, hr=115, sbp=105).level, "medium")
+        self.assertEqual(settled(spo2=88, hr=135, sbp=105).level, "high")
+
+    def test_probe_off_keeps_the_alarm(self):
+        t = settled(spo2=88)
+        self.assertEqual(feed(t, [values(spo2=None)] * 2 * W), [])
+
+    def test_arrhythmia_needs_irregular_beats(self):
+        fast = [values(hr=115)] * 30
+        irregular = [115 + (12 if i % 2 else -12) for i in range(30)]
+        # HR 115 scores 2; from 11 raw samples (10 jumps) on, the rhythm is
+        # irregular and HR scores 3, which must then hold for the window
+        self.assertEqual(feed(Triage(), fast, irregular),
+                         [(W - 1, "low"), (10 + W - 1, "low-medium")])
+        steady = feed(Triage(), fast)  # fast but regular: exercise, fever
+        self.assertEqual(steady, [(W - 1, "low")])
+
+
+def simulate(seed, ticks=5400, patients=3):
+    """Run the whole closed loop like monitor.run; return events, alerts."""
+    ps = make_patients(patients, seed)
+    procs = {p.id: EdgeProcessor() for p in ps}
+    triages = {p.id: Triage() for p in ps}
+    events, alerts = [], []
+    for i in range(ticks):
+        _, _, started, changes, ended = tick(ps, procs, triages, i * 2.0, 2.0)
+        events += started
+        alerts += changes
+        for e in ended:  # like storage.save: close the patient's open events
+            for open_event in events:
+                if (open_event["patient_id"] == e["patient_id"]
+                        and open_event["end_ts"] is None):
+                    open_event["end_ts"] = e["end_ts"]
+    return events, alerts
 
 
 class GroundTruthTest(unittest.TestCase):
     """Score the whole closed loop on 9 simulated patient-hours."""
 
-    def test_no_false_critical_and_crises_caught(self):
-        crises, false_critical = [], 0
-        for patient in make_patients(3, seed=1):
-            proc, triage, crisis = EdgeProcessor(), Triage(), None
-            for t in range(5400):  # 3 hours
-                reading, started, ended = patient.step()
-                change = triage.assess(reading, proc.process(reading))
-                if triage.level == "critical":
-                    patient.alarm()
-                if started and started.shift:
-                    # already alarming from the previous crisis: covered
-                    crisis = {"until": None,
-                              "caught": triage.level == "critical"}
-                    crises.append(crisis)
-                if ended and ended.shift:
-                    crisis["until"] = t + 20  # filter and confirmation delay
-                if change and change[0] == "critical":
-                    if crisis and (crisis["until"] is None
-                                   or t <= crisis["until"]):
-                        crisis["caught"] = True
-                    else:
-                        false_critical += 1
-        caught = sum(c["caught"] for c in crises)
-        self.assertEqual(false_critical, 0)
-        self.assertGreater(len(crises), 50)
-        self.assertGreaterEqual(caught / len(crises), 0.95)
+    def test_no_false_alarm_and_crises_caught(self):
+        events, alerts = simulate(seed=1)
+        s = score(events, alerts, now=5400 * 2.0)
+        done = s["caught"] + s["covered"] + s["missed"]
+        self.assertEqual(s["false_alarms"], 0)
+        self.assertGreater(s["crises"], 50)
+        self.assertGreaterEqual((s["caught"] + s["covered"]) / done, 0.95)
+        self.assertIn("worsening", {e["kind"] for e in events})
 
 
 class ScoreTest(unittest.TestCase):
@@ -97,19 +155,27 @@ class ScoreTest(unittest.TestCase):
             return {"patient_id": pid, "ts": ts, "level": level}
 
         events = [crisis("P1", 100, 200),   # caught 30 s in
-                  crisis("P1", 205, 260),   # still Critical: covered
+                  crisis("P1", 205, 260),   # still alarming: covered
                   crisis("P2", 100, 150),   # no alert: missed
                   crisis("P3", 900, None),  # just started: pending
                   {"patient_id": "P2", "kind": "spike", "start_ts": 500,
                    "end_ts": 502}]
-        alerts = [alert("P1", 130, "critical"),
-                  alert("P2", 600, "critical")]  # no crisis: false
+        alerts = [alert("P1", 130, "medium"),
+                  alert("P2", 600, "low-medium"),  # no crisis: false
+                  alert("P1", 700, "low-medium")]  # a step down: no alarm
         s = score(events, alerts, now=910)
         self.assertEqual((s["crises"], s["caught"], s["covered"],
                           s["missed"], s["pending"]), (4, 1, 1, 1, 1))
-        self.assertEqual(s["false_critical"], 1)
+        self.assertEqual(s["false_alarms"], 1)
         self.assertEqual(s["median_delay_s"], 30)
         self.assertEqual(s["artefacts"], 1)
+
+    def test_only_rises_into_alarm_levels_are_alarms(self):
+        alerts = [{"patient_id": "P1", "ts": t, "level": level}
+                  for t, level in [(1, "low"), (2, "low-medium"),
+                                   (3, "high"), (4, "medium"), (5, "low"),
+                                   (6, "medium")]]
+        self.assertEqual([a["ts"] for a in alarms(alerts)], [2, 3, 6])
 
 
 if __name__ == "__main__":

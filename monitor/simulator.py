@@ -11,8 +11,10 @@ On top of that we inject events:
 * clinical crises: SpO2 drop (with compensatory heart-rate rise) and
   arrhythmia (fast, irregular heart rate). They move the patient's level,
   because the body itself changes, and last until treated: a nurse reacts
-  to the monitor's Critical alarm (closed loop, see alarm()), or notices on
-  rounds if no alarm came. These should raise alerts;
+  to the monitor's alarm (closed loop, see alarm()), or notices on rounds
+  if no alarm came. The nurse treats harder the worse the alarm level, and
+  a quarter of treatments meet a complication that makes the patient worse
+  for a while (a "worsening" event). These should raise alerts;
 * artefacts: short SpO2 dips (sensor motion) and dropouts (probe off).
   They only change the reading, as the patient is fine. These should be
   filtered out, not alarmed on.
@@ -25,8 +27,10 @@ from dataclasses import dataclass
 from monitor.config import REAL_DATA_COLUMNS, REAL_DATA_CSV, SAMPLE_INTERVAL_S
 from monitor.model import fit_from_csv
 
-# Each patient's resting baseline is drawn from inside the normal range.
-BASELINE_RANGES = {"hr": (65, 85), "spo2": (97, 99), "sbp": (100, 112)}
+# Each patient's resting baseline is drawn from well inside NEWS2's
+# 0-point bands (HR 51-90, SpO2 >= 96, SBP 111-219), so a stable patient's
+# wandering rarely scores a point.
+BASELINE_RANGES = {"hr": (65, 80), "spo2": (98, 99), "sbp": (120, 130)}
 
 # Assumption: a stable patient's slow level wanders about this far from
 # baseline (1 SD) and takes about DRIFT_TIME_S to wander back. The real
@@ -49,9 +53,22 @@ CRISIS_TIME_S = {
     "arrhythmia": (2, 30),
 }
 ARRHYTHMIA_HR = (110, 150)   # rapid atrial fibrillation, BPM
-NURSE_REACTION_S = (15, 45)  # from the Critical alarm to treatment
+NURSE_REACTION_S = (10, 30)  # from the alarm to treatment
 NURSE_ROUNDS_S = 180         # an unalarmed crisis is noticed by then
 RECOVERED = 0.8              # a crisis is over 80 % of the way back
+# Treatment speed, times the recovery speed above, by the worst alarm
+# level the monitor has shown in this crisis: the worse, the harder.
+TREAT_FACTOR = {"low-medium": 1.0, "medium": 1.5, "high": 2.0}
+
+# Complication during treatment: the disease pulls toward a crisis WORSE
+# times as deep, and SBP falls, while the nurse keeps treating.
+P_WORSEN = 0.25              # share of treatments that meet one
+WORSEN_AFTER_S = (2, 20)     # from the start of treatment
+WORSEN_S = (30, 60)          # how long the disease pulls; >= the 30 s alarm
+                             # window, or the monitor could never see it
+WORSE = 2
+WORSEN_SBP_DROP = (15, 25)   # mmHg
+HR_MAX = 180                 # BPM; rapid AF rarely goes faster
 
 
 @dataclass
@@ -63,6 +80,9 @@ class Event:
     vital: str = None        # artefacts: affected vital
     shift: dict = None       # crisis: vital -> how far it moves the level
     treat_tick: int = None   # crisis: when treatment starts
+    severity: float = 1.0    # crisis: TREAT_FACTOR of the worst alarm
+    worsen: tuple = None     # crisis: (start, end) tick of a complication
+    deeper: dict = None      # crisis: vital -> shift the complication pulls to
 
 
 class Patient:
@@ -79,6 +99,7 @@ class Patient:
                          ** 0.5 for v in models}
         self.p_clinical = SAMPLE_INTERVAL_S / CLINICAL_EVENT_EVERY_S
         self.p_artifact = SAMPLE_INTERVAL_S / ARTIFACT_EVERY_S
+        self.p_worsen = P_WORSEN
         self.tick = 0
         self.event = None
         self.spikes = []  # vitals that got a real-data spike this step
@@ -96,7 +117,9 @@ class Patient:
         crisis = self.event if self.event and self.event.shift else None
         if (crisis and crisis.treat_tick is None and self.tick
                 - crisis.start_tick >= NURSE_ROUNDS_S / SAMPLE_INTERVAL_S):
-            crisis.treat_tick = self.tick  # no alarm came: noticed on rounds
+            self._treat(crisis, 0)  # no alarm came: noticed on rounds
+        if crisis and crisis.worsen and crisis.worsen[0] == self.tick:
+            started = self._worsen(crisis)
 
         reading = {}
         for vital, model in self.models.items():
@@ -118,32 +141,69 @@ class Patient:
         self.tick += 1
         return self._as_monitor_output(reading), started, ended
 
-    def alarm(self):
-        """The monitor is in Critical: a nurse comes and starts treatment."""
+    def alarm(self, level):
+        """The monitor shows an alarm `level`: a nurse comes and treats.
+
+        Treatment is as strong as the worst level shown in this crisis, and
+        keeps going through a complication: the nurse is already there.
+        """
         crisis = self.event
-        if crisis and crisis.shift and crisis.treat_tick is None:
-            delay_s = self.rng.uniform(*NURSE_REACTION_S)
-            crisis.treat_tick = self.tick + round(delay_s / SAMPLE_INTERVAL_S)
+        if not (crisis and crisis.shift):
+            return
+        crisis.severity = max(crisis.severity, TREAT_FACTOR[level])
+        if crisis.treat_tick is None:
+            self._treat(crisis, self._samples(NURSE_REACTION_S))
+
+    def _treat(self, crisis, delay):
+        """Treatment starts in `delay` samples; it may meet a complication."""
+        crisis.treat_tick = self.tick + delay
+        if self.rng.random() < self.p_worsen:
+            start = crisis.treat_tick + self._samples(WORSEN_AFTER_S)
+            crisis.worsen = (start, start + self._samples(WORSEN_S))
+
+    def _worsen(self, crisis):
+        """The complication starts: pull toward a deeper crisis, SBP falls."""
+        crisis.deeper = {v: WORSE * d for v, d in crisis.shift.items()}
+        crisis.deeper["hr"] = min(crisis.deeper["hr"],
+                                  HR_MAX - self.baseline["hr"])
+        crisis.deeper["sbp"] = -self.rng.uniform(*WORSEN_SBP_DROP)
+        return Event("worsening", self.tick)
+
+    def _samples(self, range_s):
+        """A random duration from a (low, high) range in s, in samples."""
+        return round(self.rng.uniform(*range_s) / SAMPLE_INTERVAL_S)
 
     def _treated(self, crisis):
         return crisis.treat_tick is not None and self.tick >= crisis.treat_tick
 
+    def _worsening(self, crisis):
+        return crisis.deeper is not None and self.tick < crisis.worsen[1]
+
     def _target_and_pull(self, vital, crisis):
         """Where the level heads, and how fast (share of the gap per step)."""
-        if not crisis or vital not in crisis.shift:
-            return self.baseline[vital], self.pull
+        base = self.baseline[vital]
+        if not crisis or vital not in (crisis.deeper or crisis.shift):
+            return base, self.pull
         onset_s, recovery_s = CRISIS_TIME_S[crisis.kind]
-        if self._treated(crisis):
-            return self.baseline[vital], SAMPLE_INTERVAL_S / recovery_s
-        return (self.baseline[vital] + crisis.shift[vital],
-                SAMPLE_INTERVAL_S / onset_s)
+        onset = SAMPLE_INTERVAL_S / onset_s
+        if not self._treated(crisis):
+            return base + crisis.shift[vital], onset
+        treat = SAMPLE_INTERVAL_S / recovery_s * crisis.severity
+        if not self._worsening(crisis):
+            return base, treat
+        # disease and treatment pull at once: head for their balance point
+        deep = base + crisis.deeper[vital]
+        return ((onset * deep + treat * base) / (onset + treat),
+                min(onset + treat, 1.0))
 
     def _is_over(self, event):
         if not event.shift:
             return self.tick - event.start_tick + 1 >= event.length
-        return self._treated(event) and all(
-            abs(self.level[v] - self.baseline[v]) <= (1 - RECOVERED) * abs(d)
-            for v, d in event.shift.items())
+        # 80 % back from the original crisis (SBP: from the complication)
+        return (self._treated(event) and not self._worsening(event) and all(
+            abs(self.level[v] - self.baseline[v])
+            <= (1 - RECOVERED) * abs(event.shift.get(v, d))
+            for v, d in (event.deeper or event.shift).items()))
 
     def _maybe_start_event(self):
         # shortcut: one event at a time per patient, so artefacts never overlap

@@ -7,11 +7,11 @@ DB_PATH = ROOT / "data" / "monitor.db"
 
 SAMPLE_INTERVAL_S = 2.0
 
-# Normal ranges from the task statement.
+# Normal ranges: the bands NEWS2 scores 0 (see monitor/triage.py).
 NORMAL_RANGES = {
-    "hr": (60, 100),    # heart rate, BPM
-    "spo2": (95, 100),  # blood oxygen saturation, %
-    "sbp": (90, 120),   # systolic blood pressure, mmHg
+    "hr": (51, 90),     # heart rate, BPM
+    "spo2": (96, 100),  # blood oxygen saturation, %
+    "sbp": (111, 219),  # systolic blood pressure, mmHg
 }
 
 # Column in the real CSV that each vital is fitted from.

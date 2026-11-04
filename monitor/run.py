@@ -2,7 +2,7 @@
 
 Every interval, each patient's monitor produces a raw reading, its edge
 processor cleans it and updates the 5-minute stats, the triage sets the
-level, and everything is saved. A Critical level calls the nurse, who
+level, and everything is saved. An alarm level calls the nurse, who
 treats the patient's crisis (closed loop, see Patient.alarm).
 At start-up, 5 minutes of history are pre-filled (see warm_up).
 
@@ -15,7 +15,7 @@ from monitor import storage
 from monitor.config import REAL_DATA_CSV, SAMPLE_INTERVAL_S
 from monitor.processing import STATS_WINDOW, EdgeProcessor
 from monitor.simulator import make_patients
-from monitor.triage import Triage
+from monitor.triage import ALARM_LEVELS, Triage
 
 WARMUP_SAMPLES = STATS_WINDOW  # 5 minutes of history at start-up
 
@@ -32,8 +32,8 @@ def tick(patients, processors, triages, ts, interval_s):
         if change:
             alerts.append({"patient_id": p.id, "ts": ts,
                            "level": change[0], "reason": change[1]})
-        if triages[p.id].level == "critical":
-            p.alarm()  # closed loop: the nurse hears the monitor
+        if triages[p.id].level in ALARM_LEVELS:
+            p.alarm(triages[p.id].level)  # closed loop: the nurse hears it
         if started:
             events.append({"patient_id": p.id, "kind": started.kind,
                            "vital": started.vital, "start_ts": ts,
