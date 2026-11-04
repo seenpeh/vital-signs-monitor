@@ -1,7 +1,9 @@
 """Live pipeline: simulated sensor -> edge processor -> triage -> storage.
 
 Every interval, each patient's monitor produces a raw reading, its edge
-processor cleans it and updates the 5-minute stats, and both are saved.
+processor cleans it and updates the 5-minute stats, the triage sets the
+level, and everything is saved. A Critical level calls the nurse, who
+treats the patient's crisis (closed loop, see Patient.alarm).
 At start-up, 5 minutes of history are pre-filled (see warm_up).
 
 Run:  python -m monitor.run --patients 3 --seed 42
@@ -20,9 +22,9 @@ WARMUP_SAMPLES = STATS_WINDOW  # 5 minutes of history at start-up
 
 def tick(patients, processors, triages, ts, interval_s):
     """One reading per patient at time `ts`; returns the rows to save."""
-    readings, processed, events, alerts = [], [], [], []
+    readings, processed, events, alerts, ended = [], [], [], [], []
     for p in patients:
-        reading, event = p.step()
+        reading, started, stopped = p.step()
         clean = processors[p.id].process(reading)
         readings.append({"patient_id": p.id, "ts": ts, **reading})
         processed.append({"patient_id": p.id, "ts": ts, **clean})
@@ -30,11 +32,15 @@ def tick(patients, processors, triages, ts, interval_s):
         if change:
             alerts.append({"patient_id": p.id, "ts": ts,
                            "level": change[0], "reason": change[1]})
-        if event:
-            events.append({"patient_id": p.id, "kind": event.kind,
-                           "vital": event.vital, "start_ts": ts,
-                           "end_ts": ts + event.length * interval_s})
-    return readings, processed, events, alerts
+        if triages[p.id].level == "critical":
+            p.alarm()  # closed loop: the nurse hears the monitor
+        if started:
+            events.append({"patient_id": p.id, "kind": started.kind,
+                           "vital": started.vital, "start_ts": ts,
+                           "end_ts": None})
+        if stopped:
+            ended.append({"patient_id": p.id, "end_ts": ts + interval_s})
+    return readings, processed, events, alerts, ended
 
 
 def warm_up(patients, processors, triages, interval_s, conn):
@@ -48,7 +54,7 @@ def warm_up(patients, processors, triages, interval_s, conn):
     for p in patients:
         p.p_clinical = p.p_artifact = 0
     start = time.time() - WARMUP_SAMPLES * interval_s
-    rows = ([], [], [], [])
+    rows = ([], [], [], [], [])
     for i in range(WARMUP_SAMPLES):
         new = tick(patients, processors, triages, start + i * interval_s,
                    interval_s)

@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS events (
     kind       TEXT NOT NULL,  -- spo2_drop, arrhythmia, spo2_dip, dropout
     vital      TEXT,           -- affected vital, for sensor artefacts
     start_ts   REAL NOT NULL,
-    end_ts     REAL NOT NULL
+    end_ts     REAL            -- NULL while the event is still going on
 );
 """
 
@@ -54,15 +54,18 @@ def connect(path=DB_PATH):
 
 
 def reset(conn):
+    """Start a fresh session; re-creating the tables applies schema changes."""
     with conn:
-        conn.execute("DELETE FROM readings")
-        conn.execute("DELETE FROM processed")
-        conn.execute("DELETE FROM alerts")
-        conn.execute("DELETE FROM events")
+        for table in ("readings", "processed", "alerts", "events"):
+            conn.execute(f"DROP TABLE {table}")
+    conn.executescript(SCHEMA)
 
 
-def save(conn, readings, processed, events, alerts):
-    """Insert one tick of rows, new events and alerts atomically."""
+def save(conn, readings, processed, events, alerts, ended=()):
+    """Insert one tick of rows, events and alerts atomically.
+
+    `ended` closes each patient's open event (one at a time per patient).
+    """
     with conn:
         conn.executemany(
             "INSERT INTO readings VALUES (:patient_id, :ts, :hr, :spo2, :sbp)",
@@ -80,6 +83,9 @@ def save(conn, readings, processed, events, alerts):
         conn.executemany(
             "INSERT INTO alerts VALUES (:patient_id, :ts, :level, :reason)",
             alerts)
+        conn.executemany(
+            "UPDATE events SET end_ts = :end_ts "
+            "WHERE patient_id = :patient_id AND end_ts IS NULL", ended)
 
 
 def readings_since(conn, ts):

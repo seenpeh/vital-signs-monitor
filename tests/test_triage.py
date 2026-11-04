@@ -56,22 +56,27 @@ class RuleTest(unittest.TestCase):
 
 
 class GroundTruthTest(unittest.TestCase):
-    """Score the whole edge + triage chain on 9 simulated patient-hours."""
+    """Score the whole closed loop on 9 simulated patient-hours."""
 
     def test_no_false_critical_and_crises_caught(self):
         crises, false_critical = [], 0
         for patient in make_patients(3, seed=1):
             proc, triage, crisis = EdgeProcessor(), Triage(), None
             for t in range(5400):  # 3 hours
-                reading, started = patient.step()
+                reading, started, ended = patient.step()
                 change = triage.assess(reading, proc.process(reading))
-                if started and started.kind in ("spo2_drop", "arrhythmia"):
-                    # +20 samples: filter and confirmation delay
-                    crisis = {"until": t + started.length + 20,
-                              "caught": False}
+                if triage.level == "critical":
+                    patient.alarm()
+                if started and started.shift:
+                    # already alarming from the previous crisis: covered
+                    crisis = {"until": None,
+                              "caught": triage.level == "critical"}
                     crises.append(crisis)
+                if ended and ended.shift:
+                    crisis["until"] = t + 20  # filter and confirmation delay
                 if change and change[0] == "critical":
-                    if crisis and t <= crisis["until"]:
+                    if crisis and (crisis["until"] is None
+                                   or t <= crisis["until"]):
                         crisis["caught"] = True
                     else:
                         false_critical += 1

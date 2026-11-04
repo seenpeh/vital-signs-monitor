@@ -1,9 +1,10 @@
 import random
 import unittest
 
-from monitor.config import NORMAL_RANGES
+from monitor.config import NORMAL_RANGES, SAMPLE_INTERVAL_S
 from monitor.model import VitalModel, fit
-from monitor.simulator import Event, Patient, make_patients
+from monitor.simulator import (NURSE_REACTION_S, NURSE_ROUNDS_S, Event,
+                               Patient, make_patients)
 
 MODELS = {"hr": VitalModel(0.0, 0.0005, (8.0, -8.0)),
           "spo2": VitalModel(0.1, 0.0, ()),
@@ -59,17 +60,53 @@ class PatientTest(unittest.TestCase):
             inside = sum(low <= r[vital] <= high for r in readings)
             self.assertGreater(inside / len(readings), 0.95, vital)
 
-    def test_spo2_drop_goes_below_90_and_raises_hr(self):
+    def crisis(self, p, kind, **shift):
+        p.event = Event(kind, p.tick, shift=shift)
+
+    def test_spo2_drop_moves_the_level_and_raises_hr(self):
         p = self.quiet_patient()
         normal_hr = p.step()[0]["hr"]
-        p.event = Event("spo2_drop", p.tick, 30, size=12)
+        self.crisis(p, "spo2_drop", spo2=-12, hr=20)
         mid = [p.step()[0] for _ in range(15)][-1]
         self.assertLess(mid["spo2"], 90)
+        self.assertLess(p.level["spo2"], 90)  # the body changed, not the probe
         self.assertGreater(mid["hr"], normal_hr + 15)
+
+    def test_untreated_crisis_lasts_until_rounds(self):
+        p = self.quiet_patient()
+        self.crisis(p, "spo2_drop", spo2=-12, hr=20)
+        ends = [p.step()[2] for _ in range(200)]
+        end = next(i for i, e in enumerate(ends) if e)
+        rounds = NURSE_ROUNDS_S / SAMPLE_INTERVAL_S
+        self.assertGreater(end, rounds)      # still low until noticed
+        self.assertLess(end, rounds + 30)    # then recovers within a minute
+
+    def test_alarm_starts_treatment_after_the_nurse_arrives(self):
+        p = self.quiet_patient()
+        self.crisis(p, "arrhythmia", hr=60)
+        for _ in range(10):
+            p.step()
+        p.alarm()
+        treat = p.event.treat_tick - p.tick
+        low, high = (s / SAMPLE_INTERVAL_S for s in NURSE_REACTION_S)
+        self.assertTrue(low <= treat <= high)
+        p.alarm()  # a second alarm doesn't call the nurse again
+        self.assertEqual(p.event.treat_tick - p.tick, treat)
+        ends = [p.step()[2] for _ in range(100)]
+        self.assertIsNotNone(next(e for e in ends if e))
+        self.assertLess(abs(p.level["hr"] - p.baseline["hr"]), 13)
+
+    def test_arrhythmia_is_fast_and_irregular(self):
+        p = self.quiet_patient()
+        self.crisis(p, "arrhythmia", hr=60)
+        hr = [p.step()[0]["hr"] for _ in range(20)][5:]
+        self.assertGreater(min(hr), 100)
+        jumps = [abs(b - a) for a, b in zip(hr, hr[1:])]
+        self.assertGreater(sorted(jumps)[len(jumps) // 2], 3)
 
     def test_dropout_gives_missing_value(self):
         p = self.quiet_patient()
-        p.event = Event("dropout", p.tick, 2, vital="sbp")
+        p.event = Event("dropout", p.tick, length=2, vital="sbp")
         self.assertIsNone(p.step()[0]["sbp"])
         self.assertIsNone(p.step()[0]["sbp"])
         self.assertIsNotNone(p.step()[0]["sbp"])  # event over

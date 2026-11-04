@@ -2,6 +2,7 @@ import unittest
 
 from monitor.processing import EdgeProcessor, rolling_median, window_stats
 from monitor.simulator import make_patients
+from monitor.triage import LONG_DESAT_SAMPLES
 
 
 def run_filter(values):
@@ -56,8 +57,8 @@ class GroundTruthTest(unittest.TestCase):
     """Run hours of simulated data and score the filter on SpO2 < 90 %.
 
     Bursts of motion dips (4+ glitches within 14 s) do get through the
-    median as short false lows; step 3 must reject them by persistence
-    and heart rate. This test pins down the limit step 3 relies on.
+    median as short false lows (about 20 s at most); the triage must reject
+    them by persistence and heart rate. This test pins down that limit.
     """
 
     def test_false_lows_short_and_real_drops_kept(self):
@@ -66,12 +67,14 @@ class GroundTruthTest(unittest.TestCase):
             proc = EdgeProcessor()
             drop, left, run = None, 0, 0
             for _ in range(5400):  # 3 hours
-                reading, started = patient.step()
+                reading, started, ended = patient.step()
                 clean = proc.process(reading)["spo2"]
                 if started and started.kind == "spo2_drop":
                     drop = {"seen": False}
                     drops.append(drop)
-                    left = started.length + 4  # +4: filter recovery time
+                    left = float("inf")  # no nurse here: lasts until rounds
+                if ended and ended.kind == "spo2_drop":
+                    left = 4  # filter recovery time
                 low = clean is not None and clean < 90
                 if left > 0:
                     drop["seen"] = drop["seen"] or low
@@ -80,7 +83,8 @@ class GroundTruthTest(unittest.TestCase):
                 else:
                     run = run + 1 if low else 0
                     longest_false = max(longest_false, run)
-        self.assertLess(longest_false * 2, 20)  # seconds; step 3 waits 20 s
+        # glitches don't raise HR, so only the 40 s low-SpO2 rule applies
+        self.assertLess(longest_false, LONG_DESAT_SAMPLES)
         self.assertGreater(len(drops), 20)
         self.assertTrue(all(d["seen"] for d in drops))  # every drop caught
 

@@ -38,6 +38,7 @@ monitor/run.py  (one program, one loop every 2 s)
   ├─ simulator.py   sensor:  makes a raw reading per patient
   ├─ processing.py  edge:    cleans it, updates 5-minute stats
   ├─ triage.py      decides Normal / Warning / Critical
+  │                   (Critical calls the simulated nurse: Patient.alarm)
   └─ storage.py     saves raw + processed + alerts + events  ──▶  data/monitor.db (SQLite)
                                                               │ reads
                                                          dashboard.py
@@ -49,7 +50,7 @@ monitor/run.py  (one program, one loop every 2 s)
 | Edge processing | `monitor/processing.py` | One `EdgeProcessor` per patient: filters each reading and keeps 5-minute statistics. |
 | Alert & triage | `monitor/triage.py` | One `Triage` per patient: turns processed values into a level and logs an alert whenever the level changes. |
 | Storage | `monitor/storage.py` | SQLite in WAL mode, so the dashboard can read while the pipeline writes. Tables: `readings` (raw), `processed`, `alerts`, `events`. |
-| Pipeline | `monitor/run.py` | Connects the layers. Each layer is its own module and knows nothing about the others. |
+| Pipeline | `monitor/run.py` | Connects the layers. Each layer is its own module and knows nothing about the others. It also closes the loop: while a patient is Critical, it calls `patient.alarm()`, the simulated nurse. |
 | UI | `dashboard.py` | Streamlit. Refreshes every 2 s and shows the last 5 minutes, with raw and cleaned data in separate charts. |
 | Config | `monitor/config.py` | Normal ranges, paths and the sampling interval. |
 
@@ -105,12 +106,30 @@ reading  = round(reading)                              # monitors report whole n
 
 | Kind | What happens | Duration | Should the system alarm? |
 |---|---|---|---|
-| `spo2_drop` | SpO2 falls 10–15 points (to about 85 %). HR rises by about 25 to compensate. | 60–120 s | Yes, critical |
-| `arrhythmia` | HR jumps about 35 BPM and becomes irregular (±12 per sample) | 30–90 s | Yes |
+| `spo2_drop` | The patient's SpO2 level falls 10–15 points (to about 85 %) over ~20 s, and the HR level rises 15–30 BPM to compensate | until treated | Yes, critical |
+| `arrhythmia` | Rapid atrial fibrillation: the HR level jumps within a few beats to 110–150 BPM, and the reading becomes irregular (±12 BPM beat to beat) | until treated | Yes, critical |
 | `spo2_dip` | SpO2 falsely drops 10–20 points (probe motion) | 1–3 samples | No, filter it out |
 | `dropout` | One vital sends nothing (probe off) | 2–5 samples | No |
 
-Each patient averages one clinical event every 3 minutes and one artefact every 30 seconds. The real case has no SpO2 spikes, but motion-induced SpO2 drops are the classic false alarm, so we inject them to test the filter. The natural HR and SBP spikes from the real data are background texture and are not logged. Every event is saved to the `events` table as ground truth. That table lets us measure false alarms and missed alarms later. The detector itself must never read it.
+Each patient averages one clinical event every 3 minutes and one artefact every 30 seconds, one event at a time. The real case has no SpO2 spikes, but motion-induced SpO2 drops are the classic false alarm, so we inject them to test the filter. The natural HR and SBP spikes from the real data are background texture and are not logged.
+
+**Crises change the body, artefacts only the reading.** A crisis moves the patient's slow `level` (the same random walk as above) toward a crisis target, and the level comes back only once the crisis is treated. Each phase has its own speed, as a time constant (how long the level takes to cover most of the gap):
+
+| Phase | `spo2_drop` | `arrhythmia` | Normal drift |
+|---|---|---|---|
+| Onset (level → crisis target) | 8 s: hypoxia sets in over ~20 s | 2 s: the rhythm flips within a few beats | |
+| Recovery (level → baseline, once treated) | 15 s (20× normal): oxygen works fast | 30 s (10× normal) | 300 s |
+
+```
+target, pull = baseline, 2/300                       # normal
+target, pull = baseline + crisis shift, 2/onset_s    # crisis, not yet treated
+target, pull = baseline, 2/recovery_s                # treated
+level += pull * (target - level) + N(0, drift_sd)
+```
+
+**Closed loop: a nurse treats the crisis.** While the triage engine reports Critical, the pipeline calls `patient.alarm()`. The nurse arrives 15–45 s later and the recovery phase starts. If no alarm comes, the nurse notices on rounds after 3 minutes. The crisis is over once the level is 80 % of the way back to baseline. So a crisis lasts as long as detection plus treatment take: in practice about 40–150 s. Real rate control of atrial fibrillation takes minutes; it is compressed here so the demo shows the recovery.
+
+Every event is saved to the `events` table as ground truth (`end_ts` stays empty while the event is still going on). That table lets us measure false alarms and missed alarms. The detector itself never reads it.
 
 ## Edge processing
 
@@ -129,7 +148,7 @@ real drop:  97 97 97 [85 85 85 85]   → sorted 85 85 85 [85] 97 97 97 → 85  �
 
 Why not a moving average or EMA? An average lets a −40 spike pull the result down for several samples, so glitches leak through and could trigger alarms.
 
-**Known limit:** a *burst* of motion glitches (4 or more within 14 s) looks exactly like the start of a real drop, so it passes the filter. In 9 simulated patient-hours this happened 58 times, each lasting at most 18 s. The alert engine handles these (see below): a motion glitch does not raise the heart rate and lasts only seconds, while a real desaturation raises HR and lasts minutes. `tests/test_processing.py` checks this guarantee: false lows are always shorter than 20 s, and every real drop is still caught.
+**Known limit:** a *burst* of motion glitches (4 or more within 14 s) looks exactly like the start of a real drop, so it passes the filter. In 27 simulated patient-hours the longest such false low lasted 26 s. The alert engine handles these (see below): a motion glitch does not raise the heart rate, so only the 40 s "low SpO2 alone" rule could fire, while a real desaturation raises HR and lasts until treated. `tests/test_processing.py` checks this guarantee: false lows are always shorter than 40 s, and every real drop is still seen.
 
 ### Window statistics (5 minutes)
 
@@ -155,7 +174,7 @@ The trend needs at least 1 minute of data, because a slope fitted over a few sec
 
 - **HR rise:** HR > 100, **or** HR at least 10 BPM above the patient's own 5-minute mean. A patient with a resting HR of 65 who jumps to 90 has risen, even though 90 is "normal".
 - **Irregular rhythm (arrhythmia):** the median jump between consecutive **raw** HR samples over the last 20 s is above 3 BPM. A normal HR never jumps more than 1 BPM per sample; an arrhythmia typically jumps about 10. The median ignores a single glitch. The cleaned HR can't be used here, because the filter smooths the irregularity away. A fast but regular HR (exercise, fever) stays a Warning.
-- **Why the waits:** bursts of motion glitches pass the filter for at most 18 s and don't raise the heart rate, so 20 s with an HR rise, or 40 s without one, rejects all of them.
+- **Why the waits:** bursts of motion glitches pass the filter for at most about 26 s and don't raise the heart rate, so 20 s with an HR rise, or 40 s without one, rejects all of them.
 - **Why the 40 s rule:** when a drop follows another event, the earlier event has already raised the 5-minute HR mean, so the compensating rise doesn't stand out. Sustained SpO2 below 90 % is critical on its own.
 
 **Alerts are stored only when a level changes** (`alerts` table: patient, time, level, reason). Going **up** a level is immediate. Going **down** needs the lower level to hold for 30 s, so a value flickering on a limit (SpO2 94 → 95 → 94) doesn't flood the log. Real monitors use the same idea, called an alarm de-escalation delay.
@@ -165,10 +184,11 @@ The trend needs at least 1 minute of data, because a slope fitted over a few sec
 | | Result |
 |---|---|
 | False Critical alarms | **0** |
-| SpO2 drops caught | 173 / 177 (98 %), median 36 s after the drop starts |
-| Arrhythmias caught | 169 / 175 (97 %), median 28 s after onset |
+| SpO2 drops | 162 in total: 156 raised a new Critical alert (median 36 s after the drop starts), 5 started while the monitor was still Critical from the previous crisis, 1 missed |
+| Arrhythmias | 164 in total: 154 raised a new Critical alert (median 28 s after onset), 10 started while the monitor was still Critical, 0 missed |
+| Crisis duration (closed loop) | 42–128 s (seed 42 also shows up to 144 s); no crisis had to wait for the nurse's 3-minute rounds |
 
-The detection time adds up from the drop's own ramp (about 10 s to cross 90 %), the filter (8 s) and the confirmation (20 s). The few missed events are a known limit; the missed arrhythmias lasted 38–78 s, so their cause isn't just short duration. `tests/test_triage.py` checks each rule, plus "zero false Critical, ≥ 95 % caught" on fresh simulated data.
+The detection time adds up from the drop's own onset (about 10 s to cross 90 %), the filter (8 s) and the confirmation (20 s). A crisis that starts during the previous one's 30 s calm-down gets no new alert, because the level never left Critical; the alarm is still on, so the nurse treats it. `tests/test_triage.py` checks each rule, plus "zero false Critical, ≥ 95 % covered" on fresh simulated data, with the nurse in the loop.
 
 ## Dashboard
 
@@ -177,7 +197,7 @@ The detection time adds up from the drop's own ramp (about 10 s to cross 90 %), 
 - **Patient cards:** the current level as a colored badge (🟢 Normal / 🟡 Warning / 🔴 Critical), then the latest cleaned HR, SpO2 and SBP, each with its trend (`+1.5/min`) and its 5-minute mean ± SD. A `—` means there is no reliable value (start-up or probe off). The cards are animated in pure CSS: a ♥ beats at the patient's own heart rate, numbers roll to their new value on each refresh, and a Critical card's border flashes red. All motion is turned off when the viewer's system asks for reduced motion.
 - **Latest alerts:** the 20 most recent level changes, with time, patient, level and reason.
 - **Charts, one row per vital:** **Raw sensor** on the left and **Cleaned by edge filter** on the right, each showing the last 5 minutes with the normal range shaded green. Both charts in a row share one y scale, so a glitch in the raw chart can be compared directly with the cleaned result. A large raw spike makes the cleaned chart look flatter.
-- **Injected events:** the simulator's ground truth (what it injected and when), for checking the filter and the alerts.
+- **Injected events:** the simulator's ground truth (what it injected and when), for checking the filter and the alerts. A crisis shows as `ongoing` until the nurse has treated it.
 
 ## Assumptions and design decisions
 
@@ -194,6 +214,7 @@ The detection time adds up from the drop's own ramp (about 10 s to cross 90 %), 
 | HR rise | HR > 100 **or** at least 10 BPM above the 5-minute mean | A fixed limit alone misses patients with a low resting HR; a jump alone misses patients who are already fast. A jump of 15 missed 29 % of drops, because an earlier event inflates the mean. |
 | Arrhythmia | HR rise **and** irregular raw HR, for 20 s | Irregularity is what defines an arrhythmia; a fast regular HR is only a Warning. |
 | Alerts stored | Only when the level changes, with a 30 s delay before going down | Keeps the log readable, and a worsening is never delayed. |
+| Crises act on the level and last until treated | A nurse treats them 15–45 s after the Critical alarm, or after 3 minutes on rounds | A real crisis changes the body and does not end on a timer. Coupling treatment to our own alarm makes detection matter, like on a ward. The recovery speeds are assumptions, chosen to look plausible; AF rate control is compressed from minutes. |
 | One event at a time per patient | Yes | Keeps the ground truth unambiguous. Can be relaxed later to test artefacts that land during a crisis. |
 | Sampling interval | 2 s | Taken from the task statement. It is also the real monitor's (GE Solar 8000M) numeric output rate. |
 

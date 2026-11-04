@@ -8,10 +8,14 @@ Each vital = slow level + jitter + occasional spikes:
 
 On top of that we inject events:
 
-* clinical: SpO2 drop (with compensatory heart-rate rise) and arrhythmia
-  (fast, irregular heart rate) - these should raise alerts;
-* artefacts: short SpO2 dips (sensor motion) and dropouts (probe off) -
-  these should be filtered out, not alarmed on.
+* clinical crises: SpO2 drop (with compensatory heart-rate rise) and
+  arrhythmia (fast, irregular heart rate). They move the patient's level,
+  because the body itself changes, and last until treated: a nurse reacts
+  to the monitor's Critical alarm (closed loop, see alarm()), or notices on
+  rounds if no alarm came. These should raise alerts;
+* artefacts: short SpO2 dips (sensor motion) and dropouts (probe off).
+  They only change the reading, as the patient is fine. These should be
+  filtered out, not alarmed on.
 
 Run it through the pipeline:  python -m monitor.run
 """
@@ -35,19 +39,30 @@ DRIFT_TIME_S = 300
 CLINICAL_EVENT_EVERY_S = 180
 ARTIFACT_EVERY_S = 30
 
+# Crisis dynamics, as (onset, recovery) time constants in seconds: how fast
+# the level moves toward the crisis, and back to baseline once treated.
+# A stable patient's level drifts with DRIFT_TIME_S (300 s).
+CRISIS_TIME_S = {
+    "spo2_drop": (8, 15),   # hypoxia sets in over ~20 s; oxygen works fast
+    # the rhythm flips within a few beats; rate control takes minutes in
+    # reality, compressed here so the demo shows the recovery
+    "arrhythmia": (2, 30),
+}
+ARRHYTHMIA_HR = (110, 150)   # rapid atrial fibrillation, BPM
+NURSE_REACTION_S = (15, 45)  # from the Critical alarm to treatment
+NURSE_ROUNDS_S = 180         # an unalarmed crisis is noticed by then
+RECOVERED = 0.8              # a crisis is over 80 % of the way back
+
 
 @dataclass
 class Event:
     kind: str
     start_tick: int
-    length: int          # in samples
-    size: float = 0.0    # depth of a drop or dip
-    vital: str = None    # affected vital, for artefacts
-
-
-def envelope(t, length, ramp):
-    """0..1 trapezoid: rise over `ramp` samples, hold, fall over `ramp`."""
-    return min(1.0, (t + 1) / ramp, (length - t) / ramp)
+    length: int = None       # artefacts: in samples (crises: until treated)
+    size: float = 0.0        # artefacts: depth of a dip
+    vital: str = None        # artefacts: affected vital
+    shift: dict = None       # crisis: vital -> how far it moves the level
+    treat_tick: int = None   # crisis: when treatment starts
 
 
 class Patient:
@@ -68,29 +83,64 @@ class Patient:
         self.event = None
 
     def step(self):
-        """Advance one sample. Returns (reading, event started now or None)."""
+        """Advance one sample.
+
+        Returns (reading, event started now or None, event ended now or None).
+        """
         rng = self.rng
+        started = ended = None
+        if self.event is None:
+            self.event = started = self._maybe_start_event()
+        crisis = self.event if self.event and self.event.shift else None
+        if (crisis and crisis.treat_tick is None and self.tick
+                - crisis.start_tick >= NURSE_ROUNDS_S / SAMPLE_INTERVAL_S):
+            crisis.treat_tick = self.tick  # no alarm came: noticed on rounds
+
         reading = {}
         for vital, model in self.models.items():
-            gap = self.baseline[vital] - self.level[vital]
-            self.level[vital] += (self.pull * gap
-                                  + rng.gauss(0, self.drift_sd[vital]))
+            target, pull = self._target_and_pull(vital, crisis)
+            gap = target - self.level[vital]
+            drift = rng.gauss(0, self.drift_sd[vital])
+            self.level[vital] += pull * gap + drift
             # jitter is drawn fresh each sample, so it never accumulates
             reading[vital] = self.level[vital] + rng.gauss(0, model.jitter_sd)
             if model.spike_sizes and rng.random() < model.spike_rate:
                 reading[vital] += rng.choice(model.spike_sizes)  # a real one
 
-        started = None
-        if self.event is None:
-            self.event = started = self._maybe_start_event()
-
         if self.event:
             self._apply(self.event, reading)
-            if self.tick - self.event.start_tick + 1 >= self.event.length:
-                self.event = None
+            if self._is_over(self.event):
+                ended, self.event = self.event, None
 
         self.tick += 1
-        return self._as_monitor_output(reading), started
+        return self._as_monitor_output(reading), started, ended
+
+    def alarm(self):
+        """The monitor is in Critical: a nurse comes and starts treatment."""
+        crisis = self.event
+        if crisis and crisis.shift and crisis.treat_tick is None:
+            delay_s = self.rng.uniform(*NURSE_REACTION_S)
+            crisis.treat_tick = self.tick + round(delay_s / SAMPLE_INTERVAL_S)
+
+    def _treated(self, crisis):
+        return crisis.treat_tick is not None and self.tick >= crisis.treat_tick
+
+    def _target_and_pull(self, vital, crisis):
+        """Where the level heads, and how fast (share of the gap per step)."""
+        if not crisis or vital not in crisis.shift:
+            return self.baseline[vital], self.pull
+        onset_s, recovery_s = CRISIS_TIME_S[crisis.kind]
+        if self._treated(crisis):
+            return self.baseline[vital], SAMPLE_INTERVAL_S / recovery_s
+        return (self.baseline[vital] + crisis.shift[vital],
+                SAMPLE_INTERVAL_S / onset_s)
+
+    def _is_over(self, event):
+        if not event.shift:
+            return self.tick - event.start_tick + 1 >= event.length
+        return self._treated(event) and all(
+            abs(self.level[v] - self.baseline[v]) <= (1 - RECOVERED) * abs(d)
+            for v, d in event.shift.items())
 
     def _maybe_start_event(self):
         # shortcut: one event at a time per patient, so artefacts never overlap
@@ -99,10 +149,13 @@ class Patient:
         roll = rng.random()
         if roll < self.p_clinical:
             if rng.random() < 0.5:
-                # 60-120 s desaturation, 10-15 points deep (98 % -> ~85 %)
-                return Event("spo2_drop", tick, rng.randint(30, 60),
-                             size=rng.uniform(10, 15))
-            return Event("arrhythmia", tick, rng.randint(15, 45))  # 30-90 s
+                # 10-15 points deep (98 % -> ~85 %); the heart compensates
+                return Event("spo2_drop", tick,
+                             shift={"spo2": -rng.uniform(10, 15),
+                                    "hr": rng.uniform(15, 30)})
+            hr = rng.uniform(*ARRHYTHMIA_HR)
+            return Event("arrhythmia", tick,
+                         shift={"hr": hr - self.baseline["hr"]})
         if roll < self.p_clinical + self.p_artifact:
             if rng.random() < 0.7:
                 # The real case has no SpO2 spikes, but motion-induced SpO2
@@ -114,13 +167,9 @@ class Patient:
         return None
 
     def _apply(self, event, reading):
-        t = self.tick - event.start_tick
-        if event.kind == "spo2_drop":
-            depth = envelope(t, event.length, ramp=8)
-            reading["spo2"] -= depth * event.size
-            reading["hr"] += depth * 25  # the heart compensates for hypoxia
-        elif event.kind == "arrhythmia":
-            reading["hr"] += 35 + self.rng.gauss(0, 12)
+        """Beat-to-beat and sensor effects, on top of the level."""
+        if event.kind == "arrhythmia":
+            reading["hr"] += self.rng.gauss(0, 12)  # irregular beats
         elif event.kind == "spo2_dip":
             reading["spo2"] -= event.size
         elif event.kind == "dropout":

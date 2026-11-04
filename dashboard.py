@@ -140,7 +140,8 @@ def show_events(events):
     table = pd.DataFrame(events)
     table["start"] = [datetime.fromtimestamp(t).strftime("%H:%M:%S")
                       for t in table.start_ts]
-    table["duration_s"] = (table.end_ts - table.start_ts).round().astype(int)
+    table["duration_s"] = ["ongoing" if pd.isna(end) else f"{end - start:.0f}"
+                           for start, end in zip(table.start_ts, table.end_ts)]
     st.dataframe(table[["start", "patient_id", "kind", "vital", "duration_s"]],
                  hide_index=True, use_container_width=True)
 
