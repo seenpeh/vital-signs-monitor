@@ -66,11 +66,19 @@ def warm_up(patients, processors, triages, interval_s, conn):
 
 
 def run(patients, processors, triages, interval_s, conn):
-    """Process one reading per patient every `interval_s` s until Ctrl+C."""
+    """Process one reading per patient every `interval_s` s until Ctrl+C.
+
+    While the dashboard has paused it, nothing is produced, and the paused
+    time is taken out of the timestamps so the recording has no gap.
+    """
     next_tick = time.monotonic()
+    paused_s = 0.0
     while True:
-        storage.save(conn, *tick(patients, processors, triages, time.time(),
-                                 interval_s))
+        if storage.is_paused(conn):
+            paused_s += interval_s
+        else:
+            storage.save(conn, *tick(patients, processors, triages,
+                                     time.time() - paused_s, interval_s))
         next_tick += interval_s
         time.sleep(max(0.0, next_tick - time.monotonic()))
 

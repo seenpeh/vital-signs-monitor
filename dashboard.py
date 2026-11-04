@@ -45,7 +45,7 @@ CARD_CSS = r"""<style>
 </style>"""
 
 
-def vital_chart(df, vital, title, domain):
+def vital_chart(df, vital, domain):
     """Line per patient with the normal range as a shaded band."""
     low, high = NORMAL_RANGES[vital]
     scale = alt.Scale(domain=domain)
@@ -57,7 +57,7 @@ def vital_chart(df, vital, title, domain):
                              axis=alt.Axis(format="%H:%M:%S")),
                      y=alt.Y(f"{vital}:Q", title=VITALS[vital], scale=scale),
                      color=alt.Color("patient_id:N", title="Patient")))
-    return (band + lines).properties(height=220, title=title)
+    return (band + lines).properties(height=220)
 
 
 def show_charts(raw, clean, vital):
@@ -66,10 +66,10 @@ def show_charts(raw, clean, vital):
     domain = [min(raw[vital].min(), clean[vital].min(), low),
               max(raw[vital].max(), clean[vital].max(), high)]
     left, right = st.columns(2)
-    left.altair_chart(vital_chart(raw, vital, "Raw sensor", domain),
+    left.altair_chart(vital_chart(raw, vital, domain),
                       use_container_width=True)
-    right.altair_chart(vital_chart(clean, vital, "Cleaned by edge filter",
-                                   domain), use_container_width=True)
+    right.altair_chart(vital_chart(clean, vital, domain),
+                       use_container_width=True)
 
 
 def fmt(value, digits=1):
@@ -156,7 +156,8 @@ def with_time(rows):
 def live_view():
     conn = storage.connect()
     try:
-        since = time.time() - WINDOW_S
+        # anchored at the newest reading: a paused sim's clock lags real time
+        since = (storage.latest_ts(conn) or time.time()) - WINDOW_S
         raw_rows = storage.readings_since(conn, since)
         clean_rows = storage.processed_since(conn, since)
         events = storage.latest_events(conn)
@@ -172,6 +173,9 @@ def live_view():
     raw, clean = with_time(raw_rows), with_time(clean_rows)
     show_latest(clean, levels)
     show_alerts(alerts)
+    left, right = st.columns(2)
+    left.subheader("Raw sensor")
+    right.subheader("Cleaned by edge filter")
     for vital in VITALS:
         show_charts(raw, clean, vital)
     show_events(events)
@@ -180,4 +184,23 @@ def live_view():
 st.set_page_config(page_title="Vital Signs Monitor", layout="wide")
 st.html(CARD_CSS)
 st.title("Vital Signs Monitor")
+
+
+def toggle_pause():
+    conn = storage.connect()
+    try:
+        storage.set_paused(conn, not storage.is_paused(conn))
+    finally:
+        conn.close()
+
+
+conn = storage.connect()
+try:
+    paused = storage.is_paused(conn)
+finally:
+    conn.close()
+st.button("▶ Resume (Space)" if paused else "⏸ Pause (Space)",
+          on_click=toggle_pause, shortcut="space")
+if paused:
+    st.caption("Simulation paused.")
 live_view()

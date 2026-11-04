@@ -54,5 +54,20 @@ class EventLogTest(unittest.TestCase):
             conn.close()
 
 
+class PauseTest(unittest.TestCase):
+    def test_pause_flag_survives_reconnect_and_reset_clears_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.db"
+            conn = storage.connect(path)
+            self.assertFalse(storage.is_paused(conn))
+            storage.set_paused(conn, True)
+            conn.close()
+            conn = storage.connect(path)  # schema re-run keeps the flag
+            self.assertTrue(storage.is_paused(conn))
+            storage.reset(conn)
+            self.assertFalse(storage.is_paused(conn))
+            conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -40,6 +40,10 @@ CREATE TABLE IF NOT EXISTS events (
     start_ts   REAL NOT NULL,
     end_ts     REAL            -- NULL while the event is still going on
 );
+
+-- Pause switch: the dashboard sets it, the pipeline obeys it.
+CREATE TABLE IF NOT EXISTS control (paused INTEGER NOT NULL);
+INSERT INTO control SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM control);
 """
 
 
@@ -58,7 +62,22 @@ def reset(conn):
     with conn:
         for table in ("readings", "processed", "alerts", "events"):
             conn.execute(f"DROP TABLE {table}")
+        conn.execute("UPDATE control SET paused = 0")
     conn.executescript(SCHEMA)
+
+
+def is_paused(conn):
+    return bool(conn.execute("SELECT paused FROM control").fetchone()[0])
+
+
+def set_paused(conn, paused):
+    with conn:
+        conn.execute("UPDATE control SET paused = ?", (int(paused),))
+
+
+def latest_ts(conn):
+    """Time of the newest reading, or None if there are none."""
+    return conn.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
 
 
 def save(conn, readings, processed, events, alerts, ended=()):
